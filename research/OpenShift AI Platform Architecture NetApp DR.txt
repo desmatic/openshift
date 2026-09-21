@@ -1,0 +1,388 @@
+# **Zero-Trust Multi-Tenant AI Platform: Disaster Recovery Strategy**
+
+## **Executive Summary**
+
+The architectural integration of high-performance artificial intelligence inference workloads within a zero-trust, multi-tenant Kubernetes environment presents profound engineering and security challenges. This report delivers an exhaustive technical analysis of a proposed Red Hat OpenShift platform leveraging HPE ProLiant DL380 Gen12 servers, Intel Xeon 6 processors, NVIDIA L4 GPUs, and NetApp AFF A900 ONTAP storage arrays. The architecture is bound by strict requirements: default-deny namespace isolation, hardware-backed cryptography via Thales Luna S750 Hardware Security Modules (HSMs), and adherence to native Red Hat lifecycle management paradigms.
+
+This analysis evaluates the integration of these specific components, highlighting hardware-to-software alignment, intricate cryptographic flows, and operational boundaries. Furthermore, it addresses site-level active-passive disaster recovery (DR), establishing rigorous Recovery Point Objective (RPO) and Recovery Time Objective (RTO) estimations alongside actionable failover and failback execution procedures. Critical administrative burdens and architectural compromises—specifically regarding GPU isolation mechanics on Ada Lovelace architecture and Kubernetes Key Management Service (KMS) v2 integrations within OpenShift—are explicitly identified and analyzed to ensure platform viability.
+
+## **Compute and Acceleration Architecture**
+
+### **NUMA Topology and PCIe Alignment**
+
+The HPE ProLiant DL380 Gen12 platform, equipped with dual Intel Xeon 6 processors and 144 physical cores, creates a highly complex Non-Uniform Memory Access (NUMA) topology. The 5th and 6th generation Intel Xeon Scalable Processors offer advanced CPU capabilities for AI, including Advanced Matrix Extensions (AMX)1. However, in a dual-socket system housing three NVIDIA L4 GPUs, physical Peripheral Component Interconnect Express (PCIe) lanes are distributed asymmetrically across the two CPU sockets. For example, two GPUs may be physically mapped to the PCIe root complex of NUMA Node 0, while the third GPU is mapped to NUMA Node 1\.
+
+If the default Kubernetes pod scheduler places a container's CPU allocation on NUMA Node 0, its memory on NUMA Node 1, and its GPU request on a PCIe lane attached to NUMA Node 1, the resulting inter-socket data transfer across the Intel Ultra Path Interconnect (UPI) will induce a severe latency penalty, often degrading throughput by 15% to 30%2. For latency-sensitive AI inference utilizing the pgvector extension or Large Language Models (LLMs), this cross-NUMA overhead is computationally unacceptable.
+
+To enforce strict hardware alignment, the OpenShift Topology Manager must be configured with the single-numa-node policy3. This policy operates effectively as an admission controller: the kubelet treats the pod as a whole and attempts to allocate the entire pod to a single NUMA node5. A pod is immediately rejected and enters a TopologyAffinityError state if its requested CPU, memory, and device resources cannot be completely satisfied by the available resources on a single NUMA node2.
+
+Implementing this requires modifying the OpenShift KubeletConfig custom resource. The deployment demands the CPU Manager to be set to the static policy, which strictly requires workloads to be deployed in the Guaranteed Quality of Service (QoS) class, where CPU and Memory requests are exactly equal to their limits4.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: machineconfiguration.openshift.io/v1  
+kind: KubeletConfig  
+metadata:  
+&nbsp;&nbsp;name: topology-manager-single-numa  
+spec:  
+&nbsp;&nbsp;machineConfigPoolSelector:  
+&nbsp;&nbsp;&nbsp;&nbsp;matchLabels:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;machineconfiguration.openshift.io/role: worker  
+&nbsp;&nbsp;kubeletConfig:  
+&nbsp;&nbsp;&nbsp;&nbsp;cpuManagerPolicy: static  
+&nbsp;&nbsp;&nbsp;&nbsp;cpuManagerReconcilePeriod: 5s  
+&nbsp;&nbsp;&nbsp;&nbsp;topologyManagerPolicy: single-numa-node  
+&nbsp;&nbsp;&nbsp;&nbsp;topologyManagerScope: pod
+
+Table 1 details the comparative behaviors of the available OpenShift Topology Manager policies, justifying the selection of the strict single-node approach for high-performance computing workloads.
+
+| Topology Policy | Allocation Behavior | Pod Rejection Condition | Ideal Workload Profile |
+| :---- | :---- | :---- | :---- |
+| none | Ignores hardware topology entirely; scheduler acts blindly. | Never rejected. | General-purpose microservices, web applications. |
+| best-effort | Attempts to align resources on preferred NUMA nodes. | Never rejected; falls back to cross-NUMA allocation. | Workloads desiring optimization but tolerant of latency spikes. |
+| restricted | Evaluates if alignment is possible across a minimum number of nodes. | Rejected if preferred alignment is impossible. | Large workloads spanning multiple sockets but requiring contiguous allocation. |
+| single-numa-node | Strictly mandates that CPU, memory, and PCIe devices reside on one node. | Rejected if resources cannot fit onto one single physical node. | Latency-critical AI inference, GPU-accelerated databases, RDMA networking. |
+
+### **NVIDIA L4 GPU Time-Slicing and Multi-Tenant Isolation Constraints**
+
+The architectural specification mandates NVIDIA L4 GPUs (Ada Lovelace architecture, 24GB GDDR6 VRAM) configured with time-slicing via the NVIDIA GPU Operator to support multi-tenant inference density. A critical architectural limitation must be highlighted here: the Ada Lovelace architecture does not support Multi-Instance GPU (MIG) hardware partitioning7.
+
+While MIG physically partitions the GPU into isolated hardware instances with dedicated memory controllers, L2 cache, and fault domains, time-slicing (alongside Multi-Process Service, or MPS) relies on software-based temporal sharing of the compute resources while exposing a single shared memory address space to all tenants9. Consequently, time-slicing provides concurrent execution but fundamentally fails to provide memory isolation or fault isolation11.
+
+In a zero-trust, multi-tenant environment, this lack of hardware isolation imposes an unreasonable security and operational stability risk. A poorly optimized or malicious tenant workload executing a memory-bound tensor operation can saturate the VRAM, triggering a GPU-level Out-Of-Memory (OOM) fault that crashes the Compute Unified Device Architecture (CUDA) context for all other tenants sharing that physical GPU8. Furthermore, because there is no hardware-enforced memory barrier, side-channel vulnerabilities become a theoretical risk in highly secure environments.
+
+To configure time-slicing, the NVIDIA GPU Operator ClusterPolicy alters the advertised resources to nvidia.com/gpu.shared, allowing the kubelet to admit multiple replicas to bind to a single physical device7. However, because this is an oversubscription model, platform administrators must assume the administrative burden of enforcing rigorous OpenShift LimitRanges and ResourceQuotas at the namespace level, coupled with deep kernel-level memory monitoring, to prevent noisy-neighbor disruptions.
+
+Table 2 contrasts the available GPU virtualization methodologies, clarifying the compromises forced by the L4 hardware selection.
+
+| Virtualization Method | Hardware Partitioning | Memory Isolation | Fault Isolation | Concurrency | Compatibility |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| **MIG** | Yes (Physical slices of SMs and L2 Cache) | Yes (Dedicated VRAM segments) | Yes (Failures isolated to instance) | High (Parallel execution) | Hopper (H100), Ampere (A100) only. |
+| **MPS (Multi-Process Service)** | No (Logical contexts via single server) | No (Shared address space) | No (Process crash can halt device) | High (True parallel execution) | Broad compatibility. |
+| **Time-Slicing** | No (Context switching by driver) | No (Shared address space) | No (Process crash can halt device) | Low (Sequential scheduling) | Universal compatibility (including L4). |
+| **Full Passthrough** | No (Entire device to one tenant) | N/A | N/A | None (Single tenant ownership) | Universal compatibility. |
+
+## **Storage and Data Platform Configuration**
+
+### **NetApp AFF A900 and Trident CSI Provisioning**
+
+To preserve storage-level data reduction efficiencies—specifically inline deduplication, compression, and compaction—application-layer Transparent Data Encryption (TDE) is strictly prohibited by the design principles. The NetApp AFF A900 must handle encryption natively at rest using NetApp Volume Encryption (NVE) or NetApp Storage Encryption (NSE). This array-level cryptography is backed by the external Thales Luna S750 HSM via the Key Management Interoperability Protocol (KMIP)12.
+
+To enforce API limitations where end-users interact exclusively with standard Kubernetes storage APIs, the NetApp Trident Container Storage Interface (CSI) abstracts all ONTAP management interfaces. For high-performance database workloads such as CloudNativePG, block storage protocols over NVMe/TCP or iSCSI (utilizing the ontap-san driver) are mandatory14. The TridentBackendConfig must specify the Storage Virtual Machine (SVM) and target the Storage Area Network (SAN) infrastructure securely.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: trident.netapp.io/v1  
+kind: TridentBackendConfig  
+metadata:  
+&nbsp;&nbsp;name: aff-a900-san-backend  
+&nbsp;&nbsp;namespace: trident  
+spec:  
+&nbsp;&nbsp;version: 1  
+&nbsp;&nbsp;storageDriverName: ontap-san  
+&nbsp;&nbsp;sanType: nvme  
+&nbsp;&nbsp;managementLIF: 10.10.10.50  
+&nbsp;&nbsp;svm: svm\_ai\_platform  
+&nbsp;&nbsp;credentials:  
+&nbsp;&nbsp;&nbsp;&nbsp;name: trident-ontap-credentials
+
+### **CloudNativePG and Vector Database Tuning**
+
+The orchestration tier utilizes the CloudNativePG (CNPG) Operator with PostgreSQL and the pgvector extension to serve as the foundational vector database for the AI platform. pgvector supports two primary index types for similarity search: Inverted File with Flat Compression (IVFFlat) and Hierarchical Navigable Small World (HNSW). While HNSW provides superior recall and lower query latency, it functions by creating a complex multi-layer graph in memory, which requires substantial computational overhead and RAM allocations during the index build phase16.
+
+To prevent OpenShift from executing OOM kills on database pods during HNSW index builds on high-dimensional vector embeddings, the CNPG Cluster specification must allocate extensive shared\_buffers and specifically tune maintenance\_work\_mem to accommodate the graph construction17.
+
+Table 3 highlights the tuning parameters required to optimize pgvector performance within the constrained Kubernetes environment.
+
+| Index Type | Build Time | Query Speed | Recall Accuracy | Memory Overhead | Tuning Parameters |
+| :---- | :---- | :---- | :---- | :---- | :---- |
+| **IVFFlat** | Fast | Moderate | Moderate to Low | Low | lists (clusters), probes (search depth). |
+| **HNSW** | Slow | Extremely Fast | Excellent | High | m (node connections, default 16), ef\_construction (build depth). |
+
+Furthermore, to adhere to active-passive DR requirements and avoid synchronous commit latency spikes across geographic boundaries, the CNPG cluster must utilize local quorum-based synchronous replication. By defining dataDurability: required and setting the replication method to any, the CNPG operator ensures that transactions are committed locally across a specified number of standby pods before acknowledging the client18. The platform relies entirely on the underlying NetApp storage array (via SnapMirror) to handle inter-site disaster recovery replication asynchronously, preventing geographic latency from stalling local database writes.
+
+## **Cryptographic Backbone and Zero-Trust Enforcement**
+
+The zero-trust posture dictates a hardware-rooted chain of trust spanning from the physical layer to the application layer, interacting across six distinct integration points.
+
+### **Thales Luna S750, HashiCorp Vault, and PKCS\#11**
+
+The Thales Luna Network S750 HSM provides the absolute Hardware Root of Trust for the ecosystem. HashiCorp Vault Enterprise connects to the Luna HSM via the PKCS\#11 cryptographic standard to facilitate auto-unseal operations and manage transit encryption20.
+
+To ensure high availability and load distribution across the cluster, the physical Luna HSM appliances must be configured in a High Availability (HA) Group22. Vault's seal stanza in the config.hcl file interfaces with the Luna HSM Client library (libCryptoki2\_64.so), explicitly targeting the virtual HA slot rather than individual physical partitions20.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+Terraform
+
+seal "pkcs11" {  
+&nbsp;&nbsp;lib            \= "/usr/safenet/lunaclient/lib/libCryptoki2\_64.so"  
+&nbsp;&nbsp;slot           \= "0"  
+&nbsp;&nbsp;pin            \= "HSM-PARTITION-PIN"  
+&nbsp;&nbsp;key\_label      \= "vault-auto-unseal-key"  
+&nbsp;&nbsp;hmac\_key\_label \= "vault-hmac-key"  
+&nbsp;&nbsp;generate\_key   \= "false"  
+}
+
+### **Kubernetes KMS v2 etcd Encryption: An Administrative Burden**
+
+The architectural specification dictates that OpenShift etcd encryption must be backed by the external HSM and Vault infrastructure. OpenShift 4.13 and newer versions support the Kubernetes KMS v2 API, which provides a significant architectural improvement over KMS v125. In KMS v1, a new Data Encryption Key (DEK) was generated for every single etcd write, requiring a costly external KMS API call per write, inducing severe latency25. In KMS v2, the API server generates a single secret seed at startup, makes one KMS API call to encrypt that seed under the remote Key Encryption Key (KEK), caches it, and derives per-object DEKs locally25.
+
+However, adhering to the mandated "Red Hat way" design principle presents a severe, unresolvable operational conflict here. Red Hat officially supports KMS v2 integration out-of-the-box only for AWS KMS via the OpenShift APIServer Operator25. No other KMS backend—including HashiCorp Vault or raw PKCS\#11—is a supported, Red Hat-managed integration for OpenShift etcd encryption25.
+
+Integrating HashiCorp Vault with OpenShift etcd requires deploying the external Vault Kubernetes Key Management plugin (vault-kube-kms)27. Because the kube-apiserver runs as a highly restricted static pod on control plane nodes, it cannot accept standard Kubernetes sidecar injections. Consequently, the vault-kube-kms plugin must be manually deployed as an unmanaged static pod in the /etc/kubernetes/manifests/ directory on every single control plane node25.
+
+This manual injection of static pods bypasses the OpenShift Machine Config Operator (MCO) and Cluster Version Operator (CVO). It imposes a massive administrative burden during routine OpenShift upgrades, as custom manifests must be maintained out-of-band and manually verified against new Red Hat release images. If the static pod fails to start due to a path change or permission error, the kube-apiserver loses access to the DEK seed, rendering the etcd database completely unreadable and causing an unrecoverable control plane failure27. This configuration is fundamentally antithetical to the automated "Red Hat way" and represents the single highest operational risk in the proposed architecture.
+
+### **Service Mesh mTLS and PKI Certificate Issuance**
+
+To achieve namespace-to-namespace zero-trust, OpenShift Service Mesh 3 (based entirely on upstream Istio, discarding the legacy Maistra fork) is deployed in Ambient Mode29. Ambient Mode eliminates the necessity of injecting Envoy sidecars into every tenant pod, drastically reducing memory consumption (by up to 90%) and CPU overhead29.
+
+The HashiCorp Vault Enterprise cluster acts as the Root Certificate Authority (CA). Through the cert-manager integration, Vault issues Intermediate CA certificates directly to the Istio control plane, ensuring that the mesh's cryptographic identity is ultimately rooted in the Luna HSM31.
+
+Ambient Mode bifurcates the data plane into two distinct layers. The ztunnel (Zero Trust Tunnel), written in Rust and deployed as a lightweight per-node DaemonSet, handles Layer 4 traffic, transparently encrypting pod-to-pod communication using STRICT mutual TLS (mTLS) backed by the Vault-issued certificates29. For advanced Layer 7 inspection and cross-tenant Pub/Sub authorization, an Envoy Waypoint proxy is deployed independently on a per-namespace basis29. Tenant isolation is enforced using Layer 7 AuthorizationPolicies bound to the Waypoint proxy, verifying JSON Web Token (JWT) claims before allowing cross-tenant API access29.
+
+### **Node-to-Node IPsec Encryption and OVN-Kubernetes**
+
+To secure physical node-to-node traffic across the underlying data center network fabric, the OVN-Kubernetes Software-Defined Network (SDN) is configured to enforce IPsec encryption. IPsec secures the virtual Geneve overlay tunnels using the Encapsulating Security Payload (ESP) protocol, providing confidentiality and integrity before the packets hit the physical Network Interface Cards (NICs)33.
+
+While modern VPN protocols like WireGuard offer lightweight cryptography (utilizing the ChaCha20-Poly1305 cipher suite) and superior kernel-space throughput35, OpenShift native deployments rely exclusively on IPsec for OVN-Kubernetes node-level encryption34. Adhering to "The Red Hat way" forces the adoption of IPsec, despite its heavier codebase and reliance on complex IKEv2 negotiations.
+
+The encryption and decryption of IP payloads in the kernel space severely impact CPU utilization. Benchmark data indicates that un-offloaded IPsec can degrade cluster network throughput by up to 75% (e.g., dropping from 8 Gbit/sec to 2 Gbit/sec)37. To mitigate this severe bottleneck, the Intel Xeon 6 processors' AES-NI instruction set must be fully engaged. Furthermore, the Maximum Transmission Unit (MTU) must be strictly managed. For jumbo frames (9000 bytes), the OVN-Kubernetes overlay MTU must be set to 8900 bytes to accommodate both the Geneve header and the IPsec ESP overhead. Failure to adjust the MTU will induce packet fragmentation, which bypasses NIC offloading capabilities and further spikes CPU utilization to unacceptable levels33.
+
+Table 4 compares the underlying capabilities of the node-level encryption protocols, illustrating the performance trade-off made to remain within the supported OpenShift ecosystem.
+
+| Protocol Characteristic | OpenShift OVN-Kubernetes (IPsec) | WireGuard (Alternative) |
+| :---- | :---- | :---- |
+| **Cryptography** | AES-GCM (Requires AES-NI offload) | ChaCha20-Poly1305 |
+| **Kernel Complexity** | High (\~100,000+ Lines of Code) | Low (\~4,000 Lines of Code) |
+| **Throughput Impact** | Severe (up to 75% degradation without offload) | Minimal (Highly efficient in software) |
+| **Red Hat Support** | Fully Supported natively via CNO | Unsupported / Third-party |
+
+### **Storage Array Encryption at Rest and Dynamic Credentials**
+
+At the storage layer, the NetApp AFF A900 interfaces directly with the HashiCorp Vault KMIP secrets engine12. The ONTAP operating system fetches the symmetric storage encryption keys from Vault, which wraps them using the Luna HSM. This fulfills the requirement that storage-level data reduction is preserved while maintaining hardware-backed cryptography at rest13.
+
+Simultaneously, at the application layer, Vault utilizes its database secrets engine to manage dynamic credentials for CloudNativePG. Rather than relying on static passwords stored in OpenShift Secrets, the application pods authenticate to Vault via Kubernetes Service Account tokens. Vault then dynamically generates short-lived, time-to-live (TTL) restricted database roles within PostgreSQL, ensuring that compromised application credentials automatically expire, neutralizing lateral movement risks39.
+
+### **OpenShift OAuth Proxy and Red Hat Advanced Cluster Security**
+
+End-user applications requiring HTTP access enforcement are fronted by the OpenShift OAuth Proxy, deployed strictly as a sidecar container alongside the application payload40. The proxy intercepts all inbound requests and delegates authentication to the centralized OpenShift OAuth server, which securely synchronizes groups from Microsoft Active Directory via LDAP integration. In a multi-tenant environment, the proxy is configured via container arguments to evaluate Kubernetes SubjectAccessReview rules. Access is constrained exclusively to users possessing specific RBAC roles within the tenant's exact namespace, establishing a seamless, auditable translation from Active Directory Group membership to zero-trust application access41.
+
+To monitor runtime execution and enforce workload isolation, Red Hat Advanced Cluster Security (ACS) continuously analyzes the network via eBPF (Extended Berkeley Packet Filter) collectors deployed on the worker nodes. ACS observes the raw socket traffic and generates baseline Kubernetes NetworkPolicies42. This provides an automated mechanism to enforce strict micro-segmentation that interoperates perfectly with the OVN-Kubernetes SDN, ensuring that the default-deny posture is dynamically updated based on actual application behavior without requiring manual firewall rule administration.
+
+## **Active-Passive Disaster Recovery Architecture**
+
+To fulfill the specific research objectives for business continuity, the architecture implements a robust Active-Passive Disaster Recovery model spanning two physically isolated data centers, governed by strict recovery objectives.
+
+### **Storage Array Replication Strategy**
+
+Data replication between the primary and secondary NetApp AFF A900 arrays relies exclusively on NetApp SnapMirror Asynchronous. While NetApp's SnapMirror Active Sync technology provides zero RPO and zero RTO via symmetric active-active mirroring, it requires exceedingly strict metropolitan latency tolerances (typically sub-millisecond) and an external ONTAP Mediator to handle quorum and split-brain scenarios44. For a geographically dispersed active-passive design, SnapMirror Asynchronous is the mandated standard, supporting long-distance replication across variable latency links45.
+
+The underlying NVMe/TCP or iSCSI LUNs provisioned dynamically by Trident are grouped into ONTAP FlexVols. SnapMirror establishes a block-level delta replication schedule (e.g., executing every 5 minutes) from the primary SVM to a dedicated data-protection (DP) SVM on the secondary storage array47.
+
+### **Mitigating Primary Site Attacks from Affecting the Secondary Site**
+
+A critical requirement of modern disaster recovery is protecting the secondary site from being corrupted by ransomware, rogue administrators, or widespread data corruption initiated at the primary site. Because asynchronous replication faithfully and blindly replicates all changes—including malicious encryption or intentional data deletion—logical air-gapping and immutable retention are absolutely essential.
+
+Table 5 outlines the specific attack vectors and the corresponding mitigation strategies implemented within the architecture.
+
+&nbsp;
+
+| Attack Vector | Vulnerability | Architectural Mitigation Strategy |
+| :---- | :---- | :---- |
+| **Ransomware Encryption** | Replicates encrypted garbage blocks to the DR site. | **ONTAP Autonomous Ransomware Protection (ARP):** Machine learning monitors file entropy and I/O patterns. Upon detecting anomalous encryption, it immediately takes a protective, out-of-band snapshot before replication occurs49. |
+| **Rogue Administrator Deletion** | Cluster-admin deletes volumes and snapshots maliciously. | **SnapLock Compliance:** Enabled on destination vaults. Creates WORM (Write Once, Read Many) tamper-proof snapshots that cannot be deleted or modified until the retention period expires, even by administrators possessing full storage root privileges51. |
+| **API Compromise** | OpenShift credentials used to manipulate storage arrays. | **API Isolation:** OpenShift Trident credentials lack permission to execute SnapMirror modifications or volume deletions on the secondary site, establishing a strict administrative boundary. |
+
+### **HSM Considerations for the Disaster Recovery Site**
+
+The secondary disaster recovery site requires local cryptographic authority to unseal Vault, issue certificates, and decrypt the NetApp volumes in the event of a total primary site loss. A standalone, independent HSM at the secondary site introduces severe split-brain risks regarding key synchronization, while routing cryptographic calls back over the WAN to the primary site defeats the fundamental purpose of geographic redundancy.
+
+The optimal design leverages a dedicated Thales Luna S750 HSM physically located at the secondary site, joined logically to the primary site via an HA Group utilizing the Secure Trusted Channel (STC) or Network Trust Link Service (NTLS) protocol53. The HA group automatically synchronizes the PKCS\#11 key material in real-time. The HashiCorp Vault Enterprise cluster spans both geographic sites; the secondary site nodes act as performance standbys during normal operations. If the primary site is destroyed, the secondary Vault nodes assume leadership via Raft consensus and auto-unseal using the locally synchronized HSM HA group member, ensuring uninterrupted cryptographic availability.
+
+## **Options for Failing Over to the Secondary Site**
+
+When a catastrophic disaster event destroys the primary OpenShift cluster, operations must rapidly transition to the secondary site. Two primary methodologies exist within this architecture: an automated, Kubernetes-native approach utilizing NetApp Trident Protect, and a manual, storage-centric approach relying on native ONTAP mechanisms.
+
+### **Option 1: Automated Failover via Trident Protect AppMirror**
+
+Trident Protect (version 24.10 and newer) provides application-aware disaster recovery, extending SnapMirror orchestration directly into the Kubernetes control plane via Custom Resource Definitions (CRDs)46. It synchronizes both the physical storage blocks and the OpenShift logical metadata (Deployments, Services, ConfigMaps, Secrets).
+
+Table 6 details the estimated recovery metrics for the automated approach.
+
+| Metric | Estimation | Dependency / Constraint |
+| :---- | :---- | :---- |
+| **Recovery Point Objective (RPO)** | 5 to 15 minutes | Strictly dependent on the defined CRD schedule and snapshot transfer delta times. |
+| **Recovery Time Objective (RTO)** | 10 to 15 minutes | Dependent on OpenShift pod scheduling efficiency and container image pull times on the secondary cluster. |
+
+**High-Level Step-by-Step Process:**
+
+> 1. **Preparation (Pre-Disaster):** Ensure that AppMirrorRelationship CRs are fully established, accurately defining the primary site as the source and the secondary site as the destination for the target namespaces56.  
+> 2. **Declare Outage:** Operationally confirm that the primary cluster and its infrastructure are entirely unreachable.  
+> 3. **Initiate Failover:** Access the secondary OpenShift cluster API via kubectl or the web console. Locate the AppMirrorRelationship CR corresponding to the affected tenant workload.  
+> 4. **Promote Destination:** Modify the CR specification to alter the desired state from Established to Promoted:  
+>    YAML  
+>    apiVersion: protect.trident.netapp.io/v1  
+>    kind: AppMirrorRelationship  
+>    metadata:  
+>    &nbsp;&nbsp;name: ai-tenant-amr  
+>    &nbsp;&nbsp;namespace: tenant-destination-ns  
+>    spec:  
+>    &nbsp;&nbsp;desiredState: Promoted
+
+> 5. **Cluster Reconciliation:** Trident Protect automatically interfaces with the underlying ONTAP APIs to break the SnapMirror relationship, transitioning the destination NetApp volumes from Read-Only (Data Protection mode) to Read-Write55.  
+> 6. **Workload Restoration:** Trident Protect orchestrates the deployment of the synchronized OpenShift resources into the tenant namespace. The CloudNativePG pods and application workloads initialize and attach to the newly writable Persistent Volume Claims (PVCs)56.  
+> 7. **DNS Cutover:** Update the Global Server Load Balancer (GSLB) or external DNS to point ingress traffic to the secondary OpenShift router IP addresses.
+
+### **Option 2: Manual ONTAP Failover and GitOps Restoration**
+
+If Trident Protect is not utilized, or if it fails due to severe control plane corruption, a manual failover relying on native ONTAP mechanisms and GitOps reconciliation (e.g., ArgoCD) provides a highly resilient fallback mechanism.
+
+Table 7 details the estimated recovery metrics for the manual approach.
+
+| Metric | Estimation | Dependency / Constraint |
+| :---- | :---- | :---- |
+| **Recovery Point Objective (RPO)** | 5 to 15 minutes | Dependent on the underlying ONTAP SnapMirror cron schedule. |
+| **Recovery Time Objective (RTO)** | 30 to 60 minutes | Heavily dependent on administrative execution speed, manual verification, and cluster scale. |
+
+**High-Level Step-by-Step Process:**
+
+> 1. **Storage Transition:** Log directly into the destination NetApp cluster CLI or ONTAP System Manager. Manually break the SnapMirror relationship for the affected volumes to make them immediately writable57:  
+>    Bash  
+>    snapmirror break \-destination-path dest\_svm:dest\_volume
+
+> 2. **Volume Import:** On the secondary OpenShift cluster, the Trident CSI must import the newly writable volumes. Administrators must generate PersistentVolume (PV) and PersistentVolumeClaim (PVC) YAML manifests that explicitly reference the precise ONTAP volume paths. Alternatively, the tridentctl import volume utility command can be utilized58.  
+> 3. **Application Deployment:** Instruct the GitOps controller (e.g., ArgoCD or Red Hat OpenShift GitOps) to deploy the tenant application manifests to the secondary cluster, pointing them strictly at the newly imported PVCs.  
+> 4. **Database Recovery:** CloudNativePG will detect the existing PostgreSQL data directory residing on the PVC. The operator will initiate crash recovery, replaying transactions up to the last consistent Write-Ahead Log (WAL) state replicated prior to the disaster.  
+> 5. **DNS Cutover:** Reroute external application traffic to the secondary site via GSLB configurations.
+
+## **Options for Failback to the Primary Site**
+
+Once the primary site is rebuilt, secured, and operationally stabilized, workloads must be transitioned back. This process requires reversing the flow of data replication to capture all database transactions and model weights that were modified at the secondary site during the disaster window.
+
+### **Option 1: Automated Failback via Trident Protect Reverse Resync**
+
+Trident Protect streamlines the failback operation by reversing the replication flow programmatically, without requiring manual storage intervention or command-line manipulation59.
+
+Table 8 details the estimated failback metrics for the automated approach.
+
+| Metric | Estimation | Dependency / Constraint |
+| :---- | :---- | :---- |
+| **Recovery Point Objective (RPO)** | Near Zero | Planned failback allows for graceful shutdown, ensuring all in-flight I/O is flushed prior to final synchronization. |
+| **Recovery Time Objective (RTO)** | 15 to 30 minutes | Dependent on the reverse-sync delta size (data accumulated during the outage) and application startup times. |
+
+**High-Level Step-by-Step Process:**
+
+> 1. **Scale Down Workloads:** Scale the tenant application pods and CloudNativePG instances to 0 replicas on the secondary cluster. This ceases all active I/O operations and guarantees absolute data consistency on the storage array.  
+> 2. **Reverse Resynchronization:** Update the AppMirrorRelationship CR on the secondary cluster to trigger a reverse resynchronization. Trident Protect orchestrates an ONTAP SnapMirror resync from the secondary array back to the primary array, overriding the primary array's obsolete or corrupted data state59.  
+> 3. **Wait for Synchronization:** Monitor the CR status until the synchronization is marked as established and fully in sync across the WAN link.  
+> 4. **Execute Failback:** Modify the AppMirrorRelationship CR to return replication control to the original primary site, promoting the primary volumes back to Read-Write status.  
+> 5. **Restore Workloads:** Scale the application manifests and CNPG databases back to their desired replica counts on the primary OpenShift cluster.  
+> 6. **DNS Reversion:** Update the GSLB to route traffic back to the primary cluster ingress routers.
+
+### **Option 2: Manual ONTAP Failback**
+
+The manual method relies entirely on ONTAP storage administrators re-establishing the original replication topology via array-level commands.
+
+Table 9 details the estimated failback metrics for the manual approach.
+
+| Metric | Estimation | Dependency / Constraint |
+| :---- | :---- | :---- |
+| **Recovery Point Objective (RPO)** | Near Zero | Planned failback guarantees no data loss through graceful workload shutdown. |
+| **Recovery Time Objective (RTO)** | 45 to 90 minutes | Highly labor-intensive; requires precise coordination between OpenShift operators and NetApp storage administrators. |
+
+**High-Level Step-by-Step Process:**
+
+> 1. **Application Quiescence:** On the secondary OpenShift cluster, gracefully terminate all tenant pods and CloudNativePG instances to flush all memory buffers to disk.  
+> 2. **Reverse SnapMirror:** Log into the primary NetApp cluster (which is currently acting as the destination for the reverse flow). Execute a snapmirror resync command to pull the delta changes from the secondary array back to the primary array60.  
+> 3. **Break and Re-establish:** Once the resynchronization is 100% complete, break the reverse SnapMirror relationship on the primary array to make the primary volumes Read-Write. Re-establish the original asynchronous SnapMirror policy from the primary array flowing to the secondary array48.  
+> 4. **Cluster Deployment:** Utilizing the GitOps pipeline, deploy the application manifests onto the primary OpenShift cluster, ensuring they attach to the local Trident-provisioned PVCs.  
+> 5. **Verification and Routing:** Validate that CNPG starts successfully and the memory-intensive pgvector HNSW indexes are intact. Shift GSLB routing back to the primary site to resume normal operations.
+
+## **Architectural Conclusions and Strategic Recommendations**
+
+The proposed zero-trust multi-tenant AI platform delivers robust computational scalability and rigorous network security. However, it requires decisive mitigation strategies to address vendor-specific hardware limitations and framework integrations.
+
+The inability to utilize hardware-partitioned MIG on NVIDIA L4 Ada Lovelace GPUs poses a persistent risk to strict tenant isolation, mandating the adoption of severe software-level quota enforcement and continuous resource monitoring to prevent cross-tenant denial-of-service. Furthermore, while the combination of HashiCorp Vault, Thales Luna HSMs, and NetApp arrays provides an impenetrable cryptographic boundary, the manual integration of KMS v2 static pods into the OpenShift control plane introduces profound architectural fragility. This integration directly contradicts the "Red Hat way" by bypassing the Cluster Version Operator, and must be rigorously managed and tested during all cluster lifecycle events.
+
+By adhering to the documented deployment tuning for OVN-Kubernetes MTU and topology management, and by executing the disaster recovery procedures via Trident Protect AppMirror, the platform ensures that in the event of catastrophic failure, business continuity is maintained securely within acceptable RPO and RTO thresholds.
+
+#### **Works cited**
+
+> 1. LLM inference using TorchServe on Red Hat OpenShift with, [https://infohub.delltechnologies.com/en-us/p/llm-inference-using-torchserve-on-red-hat-openshift-with-poweredge-r760-using-5th-gen-intel-r-xeon-r-processors-1/](https://infohub.delltechnologies.com/en-us/p/llm-inference-using-torchserve-on-red-hat-openshift-with-poweredge-r760-using-5th-gen-intel-r-xeon-r-processors-1/)  
+> 2. Kubernetes Topology Manager for GPU and NUMA Alignment, [https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/](https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/)  
+> 3. Kubelet Configuration (v1beta1) \- Kubernetes, [https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/](https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/)  
+> 4. Chapter 7\. Using Topology Manager | OpenShift Container Platform, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.3/html/scalability\_and\_performance/using-topology-manager](https://docs.redhat.com/en/documentation/openshift_container_platform/4.3/html/scalability_and_performance/using-topology-manager)  
+> 5. Control Topology Management Policies on a node \- Kubernetes, [https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)  
+> 6. Using CPU Manager and Topology Manager \- OKD Documentation, [https://docs.okd.io/4.21/scalability\_and\_performance/using-cpu-manager.html](https://docs.okd.io/4.21/scalability_and_performance/using-cpu-manager.html)  
+> 7. GPU sharing on Kubernetes: MIG vs. time-slicing \- Polyaxon, [https://polyaxon.com/blog/gpu-sharing-mig-vs-time-slicing/](https://polyaxon.com/blog/gpu-sharing-mig-vs-time-slicing/)  
+> 8. GPU Partitioning with Time Slicing, MPS, MIG and others \- GitHub, [https://github.com/rh-aiservices-bu/gpu-partitioning-guide](https://github.com/rh-aiservices-bu/gpu-partitioning-guide)  
+> 9. A comprehensive evaluation of spatial co-execution on GPUs using, [https://arxiv.org/html/2604.22430v1](https://arxiv.org/html/2604.22430v1)  
+> 10. Comparing Multi-Instance GPU (MIG) and Time-Slicing ... \- OpenMetal, [https://openmetal.io/resources/blog/mig-vs-time-slicing-gpu-sharing/](https://openmetal.io/resources/blog/mig-vs-time-slicing-gpu-sharing/)  
+> 11. MIG vs MPS vs Time-Slicing: Four Ways to Share a GPU ... \- Preporato, [https://preporato.com/blog/gpu-sharing-mig-vs-mps-vs-time-slicing](https://preporato.com/blog/gpu-sharing-mig-vs-mps-vs-time-slicing)  
+> 12. HashiCorp Vault as an External Key Manager for NetApp Encryption, [https://medium.com/hashicorp-engineering/hashicorp-vault-as-an-external-key-manager-for-netapp-encryption-7794297f6df1](https://medium.com/hashicorp-engineering/hashicorp-vault-as-an-external-key-manager-for-netapp-encryption-7794297f6df1)  
+> 13. NetApp \- Thales Trusted Cyber Technologies, [https://www.thalestct.com/netapp/](https://www.thalestct.com/netapp/)  
+> 14. Integrating SUSE® Virtualization with NetApp® Storage, [https://documentation.suse.com/trd/netapp/pdf/gs\_suse-virtualization\_netapp-trident\_iscsi\_en.pdf](https://documentation.suse.com/trd/netapp/pdf/gs_suse-virtualization_netapp-trident_iscsi_en.pdf)  
+> 15. Simplifying disaster recovery with Trident SnapMirror volume, [https://community.netapp.com/community/discussion/462334/simplifying-disaster-recovery-with-trident-snapmirror-volume-replication-for-nvme-tcp](https://community.netapp.com/community/discussion/462334/simplifying-disaster-recovery-with-trident-snapmirror-volume-replication-for-nvme-tcp)  
+> 16. pgvector/pgvector: Open-source vector similarity search for Postgres, [https://github.com/pgvector/pgvector](https://github.com/pgvector/pgvector)  
+> 17. IVFFlat vs HNSW in pgvector: Which Index Should You Use?, [https://dev.to/philip\_mcclarence\_2ef9475/ivfflat-vs-hnsw-in-pgvector-which-index-should-you-use-305p](https://dev.to/philip_mcclarence_2ef9475/ivfflat-vs-hnsw-in-pgvector-which-index-should-you-use-305p)  
+> 18. Replication | CloudNativePG, [https://cloudnative-pg.io/docs/devel/replication/](https://cloudnative-pg.io/docs/devel/replication/)  
+> 19. flexible data durability enforcement in synchronous replication \#5793, [https://github.com/cloudnative-pg/cloudnative-pg/issues/5793](https://github.com/cloudnative-pg/cloudnative-pg/issues/5793)  
+> 20. HashiCorp Vault \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp\_vault/index.html](https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp_vault/index.html)  
+> 21. Thales | HashiCorp Tech Partner, [https://www.hashicorp.com/en/partners/tech/thales](https://www.hashicorp.com/en/partners/tech/thales)  
+> 22. Configuring a Luna HSM HA group \- IBM, [https://www.ibm.com/docs/en/datapower-gateway/11.0.0?topic=distribution-configuring-luna-hsm-ha-group](https://www.ibm.com/docs/en/datapower-gateway/11.0.0?topic=distribution-configuring-luna-hsm-ha-group)  
+> 23. Configuring a Luna HSM HA Group, [https://docs.hytrust.com/CryptographicSecurityPlatformVault/Online/Content/Books/Admin-Guide/KC-System-Config/HSMs/Configuring-a-Luna-HSM-HA-Group.html](https://docs.hytrust.com/CryptographicSecurityPlatformVault/Online/Content/Books/Admin-Guide/KC-System-Config/HSMs/Configuring-a-Luna-HSM-HA-Group.html)  
+> 24. Vault Auto-unseal with a Luna HSM configured for HSM High ... \- IBM, [https://www.ibm.com/support/pages/vault-auto-unseal-luna-hsm-configured-hsm-high-availability](https://www.ibm.com/support/pages/vault-auto-unseal-luna-hsm-configured-hsm-high-availability)  
+> 25. KMS v2 (Kubernetes KMS Provider v2) \- Le Site de François, [https://lesitedefrancois.be/en/security/kmsv2/](https://lesitedefrancois.be/en/security/kmsv2/)  
+> 26. 4.13.0-0.okd-scos-2023-03-29-124824, [https://origin-release.ci.openshift.org/releasestream/4-scos-next/release/4.13.0-0.okd-scos-2023-03-29-124824](https://origin-release.ci.openshift.org/releasestream/4-scos-next/release/4.13.0-0.okd-scos-2023-03-29-124824)  
+> 27. Vault Kubernetes Key Management \- HashiCorp Developer, [https://developer.hashicorp.com/vault/docs/deploy/kubernetes/kms](https://developer.hashicorp.com/vault/docs/deploy/kubernetes/kms)  
+> 28. HashiCorp Ships Public Beta of Vault Kubernetes Key Management, [https://www.infoq.com/news/2026/08/vault-kubernetes-key-management/](https://www.infoq.com/news/2026/08/vault-kubernetes-key-management/)  
+> 29. OpenShift Service Mesh 3: what changes with Istio \- Rafael Zago, [https://www.rafaelvzago.com/en/posts/openshift-service-mesh-3/](https://www.rafaelvzago.com/en/posts/openshift-service-mesh-3/)  
+> 30. Introducing OpenShift Service Mesh 3.2 with Istio's ambient mode, [https://www.redhat.com/en/blog/introducing-openshift-service-mesh-32-istios-ambient-mode](https://www.redhat.com/en/blog/introducing-openshift-service-mesh-32-istios-ambient-mode)  
+> 31. How HashiCorp Vault and Red Hat OpenShift can work together, [https://www.redhat.com/en/blog/how-hashicorp-vault-red-hat-openshift-can-work-together](https://www.redhat.com/en/blog/how-hashicorp-vault-red-hat-openshift-can-work-together)  
+> 32. acm-ossm-flow/docs/OSSM-ACM-FULL-DEPLOYMENT.md at main, [https://github.com/rafaelvzago/acm-ossm-flow/blob/main/docs/OSSM-ACM-FULL-DEPLOYMENT.md](https://github.com/rafaelvzago/acm-ossm-flow/blob/main/docs/OSSM-ACM-FULL-DEPLOYMENT.md)  
+> 33. Chapter 11\. Optimizing networking | Scalability and performance, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.11/html/scalability\_and\_performance/optimizing-networking](https://docs.redhat.com/en/documentation/openshift_container_platform/4.11/html/scalability_and_performance/optimizing-networking)  
+> 34. Encrypting the network traffic with Ipsec in OpenShift 4, [https://rcarrata.com/openshift/ipsec-opc4/](https://rcarrata.com/openshift/ipsec-opc4/)  
+> 35. WireGuard vs OpenVPN vs IPsec: A 2026 Engineering Comparison, [https://www.quickztna.com/blog/wireguard-vs-openvpn-vs-ipsec/](https://www.quickztna.com/blog/wireguard-vs-openvpn-vs-ipsec/)  
+> 36. VPN Protocols Compared: WireGuard vs OpenVPN vs IPSec (2026), [https://perfectnotes.org/notes/cybersecurity/vpn-protocol-comparison](https://perfectnotes.org/notes/cybersecurity/vpn-protocol-comparison)  
+> 37. Network performance impact on OpenShift Container Platform 4, [https://access.redhat.com/solutions/6994923](https://access.redhat.com/solutions/6994923)  
+> 38. Optimizing networking | Scalability and performance | OKD 4.18, [https://docs.okd.io/4.18/scalability\_and\_performance/optimization/optimizing-networking.html](https://docs.okd.io/4.18/scalability_and_performance/optimization/optimizing-networking.html)  
+> 39. How to integrate HashiCorp Vault with OpenShift for Secret, [https://rdalal3.medium.com/how-to-integrate-hashicorp-vault-with-openshift-for-secret-management-25f4becff9ba](https://rdalal3.medium.com/how-to-integrate-hashicorp-vault-with-openshift-for-secret-management-25f4becff9ba)  
+> 40. OpenShift | Capsule, [https://projectcapsule.dev/docs/operating/setup/openshift/](https://projectcapsule.dev/docs/operating/setup/openshift/)  
+> 41. Using OpenShift OAuth Proxy to secure your Applications ... \- Linuxera, [https://linuxera.org/oauth-proxy-secure-applications-openshift/](https://linuxera.org/oauth-proxy-secure-applications-openshift/)  
+> 42. RHACS Network Segmentation Policies | K8s Recipes, [https://kubernetes.recipes/recipes/security/rhacs-network-segmentation/](https://kubernetes.recipes/recipes/security/rhacs-network-segmentation/)  
+> 43. Network Segmentation using Red Hat Advanced Cluster Security for, [https://medium.com/@dlakshma/network-segmentation-using-red-hat-advanced-cluster-security-for-kubernetes-rhacs-0d5bd5998319](https://medium.com/@dlakshma/network-segmentation-using-red-hat-advanced-cluster-security-for-kubernetes-rhacs-0d5bd5998319)  
+> 44. ONTAP SnapMirror active sync architecture \- NetApp Docs, [https://docs.netapp.com/us-en/ontap/snapmirror-active-sync/architecture-concept.html](https://docs.netapp.com/us-en/ontap/snapmirror-active-sync/architecture-concept.html)  
+> 45. Create an ONTAP SnapMirror replication relationship \- NetApp Docs, [https://docs.netapp.com/us-en/ontap/data-protection/create-replication-relationship-task.html](https://docs.netapp.com/us-en/ontap/data-protection/create-replication-relationship-task.html)  
+> 46. Replicate applications using NetApp SnapMirror and Trident Protect, [https://docs.netapp.com/us-en/trident/trident-protect/trident-protect-use-snapmirror-replication.html](https://docs.netapp.com/us-en/trident/trident-protect/trident-protect-use-snapmirror-replication.html)  
+> 47. snapmirror create | ONTAP 9.10.1 | Lenovo Docs, [https://pubs.lenovo.com/command\_reference\_9-10-1/snapmirror\_\_create](https://pubs.lenovo.com/command_reference_9-10-1/snapmirror__create)  
+> 48. Netapp Snapmirror Setup \- Sysadmin Tutorials, [https://www.sysadmintutorials.com/tutorials/netapp/netapp-data-ontap-7-mode/netapp-snapmirror-setup/](https://www.sysadmintutorials.com/tutorials/netapp/netapp-data-ontap-7-mode/netapp-snapmirror-setup/)  
+> 49. NetApp CYBER SECURITY, [https://www.icos.it/wp-content/uploads/2024/10/NETAPP.pdf](https://www.icos.it/wp-content/uploads/2024/10/NETAPP.pdf)  
+> 50. Lock an ONTAP snapshot for protection against ransomware attacks, [https://docs.netapp.com/us-en/ontap/snaplock/snapshot-lock-concept.html](https://docs.netapp.com/us-en/ontap/snaplock/snapshot-lock-concept.html)  
+> 51. SnapLock and tamperproof snapshots for ransomware protection, [https://docs.netapp.com/us-en/ontap-technical-reports/ransomware-solutions/ransomware-snaplock-tamperproof-snapshots.html](https://docs.netapp.com/us-en/ontap-technical-reports/ransomware-solutions/ransomware-snaplock-tamperproof-snapshots.html)  
+> 52. NetApp Data Protection \- WWT, [https://www.wwt.com/workshop/netapp-data-protection](https://www.wwt.com/workshop/netapp-data-protection)  
+> 53. Luna Extensions to PKCS\#11 \- Thales Docs, [https://thalesdocs.com/gphsm/luna/7/docs/network/Content/sdk/extensions/safenet\_extensions.htm](https://thalesdocs.com/gphsm/luna/7/docs/network/Content/sdk/extensions/safenet_extensions.htm)  
+> 54. Secure Trusted Channel (STC) \- Thales Docs, [https://thalesdocs.com/gphsm/luna/6.3/docs/network/Content/administration/stc/stc.htm](https://thalesdocs.com/gphsm/luna/6.3/docs/network/Content/administration/stc/stc.htm)  
+> 55. Announcing NetApp Disaster Recovery for Kubernetes, now in, [https://community.netapp.com/community/discussion/467099/announcing-netapp-disaster-recovery-for-kubernetes-now-in-public-preview](https://community.netapp.com/community/discussion/467099/announcing-netapp-disaster-recovery-for-kubernetes-now-in-public-preview)  
+> 56. OpenShift Virtualization Disaster Recovery with NetApp Trident Protect, [https://community.netapp.com/community/discussion/460716/openshift-virtualization-disaster-recovery-with-netapp-trident-protect](https://community.netapp.com/community/discussion/460716/openshift-virtualization-disaster-recovery-with-netapp-trident-protect)  
+> 57. netapp snapmirror dr with lun example \- Secured Home of uadmin.nl, [http://uadmin.nl/init/netapp-snapmirror-dr-with-lun/](http://uadmin.nl/init/netapp-snapmirror-dr-with-lun/)  
+> 58. Data protection and disaster recovery \- Trident \- NetApp Docs, [https://docs.netapp.com/us-en/trident/trident-reco/backup.html](https://docs.netapp.com/us-en/trident/trident-reco/backup.html)  
+> 59. Power Up Kubernetes Replication for Protection & Disaster Recovery, [https://community.netapp.com/community/discussion/459777/trident-protect-power-up-kubernetes-replication-for-protection-disaster-recovery](https://community.netapp.com/community/discussion/459777/trident-protect-power-up-kubernetes-replication-for-protection-disaster-recovery)  
+> 60. NetApp ONTAP or ElementSW Manage SnapMirror, [https://docs.ansible.com/projects/ansible/latest/collections/netapp/ontap/na\_ontap\_snapmirror\_module.html](https://docs.ansible.com/projects/ansible/latest/collections/netapp/ontap/na_ontap_snapmirror_module.html)
