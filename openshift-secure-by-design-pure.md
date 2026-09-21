@@ -22,7 +22,7 @@ I need you to perform a deep-dive technical validation, compatibility analysis, 
    - Luna Network S750 HSM (Hardware Root of Trust via PKCS#11 and KMIP)
    - HashiCorp Vault Enterprise (Auto-unscaled via Luna HSM, managing dynamic database credentials and Istio Intermediate CA)
    - Active Directory (LDAP Group Sync to OpenShift RBAC, user authentication)
-   - OpenShift Service Mesh / Istio (STRICT mTLS, Layer 7 AuthorizationPolicies for cross-tenant Pub/Sub)
+   - OpenShift Service Mesh / Istio in Ambient Mode (STRICT mTLS, Layer 7 AuthorizationPolicies for cross-tenant Pub/Sub)
    - OpenShift OAuth Proxy (Sidecar pattern enforcing AD-based HTTP access)
    - Red Hat Advanced Cluster Security (ACS) for runtime security & container image scanning
 

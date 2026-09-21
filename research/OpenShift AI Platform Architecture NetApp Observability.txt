@@ -1,0 +1,441 @@
+# **Zero-Trust Multi-Tenant AI Platform: Observability**
+
+## **1\. Architectural Baseline and Cryptographic Foundation**
+
+The architectural design for this United Kingdom-based multi-tenant artificial intelligence platform represents a convergence of high-performance accelerated computing, strict cryptographic guarantees, and absolute zero-trust network boundaries. The underlying physical infrastructure is anchored by HPE ProLiant DL380 Gen12 hardware, featuring Dual Intel Xeon 6 processors providing 144 total cores, coupled with 4TB of DDR5 RAM per node. To support concurrent inference pipelines, each worker node is equipped with three NVIDIA L4 GPUs utilizing the Ada Lovelace architecture.
+
+Storage is backed by a NetApp AFF A900 Trident CSI ONTAP array. To satisfy the non-negotiable requirement of preserving storage-level data reduction (deduplication and compression), application-layer Transparent Data Encryption (TDE) is eschewed in favor of array-level encryption1. All persistent volume claims (PVCs) reside exclusively on this storage array, and API boundaries strictly prohibit end-users from accessing the proprietary array management interfaces2.
+
+The orchestration layer is powered by Red Hat OpenShift, adhering strictly to "the Red Hat way." This principle mandates that wherever a Red Hat-native or Red Hat-certified component exists, it supersedes community equivalents to maintain a unified support lifecycle. Within this environment, CloudNativePG (CNPG) operates alongside PostgresML and pgvector extensions, while the NVIDIA GPU Operator manages time-sliced GPU access for multi-tenant inference tasks3.
+
+In such a densely packed, multi-tenant environment running sensitive AI workloads, observability cannot be an afterthought; it must be an intrinsic, securely bounded capability. This report exhaustively details the implementation of a comprehensive observability stack—encompassing metrics, logs, and distributed traces—while maintaining strict cryptographic and logical isolation between tenants.
+
+### **1.1 The Hardware Root of Trust and Cryptographic Integration**
+
+The security posture relies on a Thales Luna Network S750 Hardware Security Module (HSM), which acts as the ultimate Hardware Root of Trust via PKCS\#11 and KMIP interfaces4. HashiCorp Vault Enterprise interfaces with the Luna HSM to auto-unseal and manage the lifecycle of dynamic PostgreSQL credentials and Istio Intermediate Certificate Authorities (CAs)6.
+
+The integration of the HSM spans six critical domains, each requiring specific observability strategies to ensure cryptographic operations do not become system bottlenecks:
+
+> 1. **etcd Encryption at Rest:** OpenShift utilizes Kubernetes KMS v2 to encrypt secrets before committing them to etcd. HashiCorp Vault acts as the external KMS provider, with its master key securely wrapped by the Luna HSM6.  
+> 2. **Certificate Issuance (PKI/CA):** Vault serves as the PKI engine. The Vault Secrets Operator (VSO) synchronizes these certificates into standard Kubernetes TLS Secrets for consumption by OpenShift Service Mesh9.  
+> 3. **Service Mesh mTLS:** Pod-to-pod communication across namespaces is secured via STRICT mTLS enforced by Istio (OpenShift Service Mesh 3.0), utilizing the certificates issued by the Vault-backed CA10.  
+> 4. **Node-to-Node Network Encryption:** The OpenShift OVN-Kubernetes default Container Network Interface (CNI) is configured with IPsec enabled. The IPsec keys are derived securely, ensuring all host-level traffic is encrypted in transit.  
+> 5. **Storage Array Encryption:** The NetApp AFF A900 utilizes NetApp Volume Encryption (NVE) and NetApp Aggregate Encryption (NAE). Instead of relying on the onboard key manager, ONTAP communicates directly with the Luna S750 HSM via the Key Management Interoperability Protocol (KMIP) to retrieve cryptographic keys for at-rest encryption.  
+> 6. **HashiCorp Vault Auto-Unseal:** Vault utilizes the Luna HSM via PKCS\#11 for transit auto-unseal mechanisms, ensuring that manual intervention is not required during pod rescheduling or node reboots6.
+
+### **1.2 Observing the Cryptographic Boundary**
+
+Monitoring this cryptographic infrastructure is paramount. The Vault Secrets Operator exposes a /metrics endpoint in Prometheus format9. A ServiceMonitor deployed in the vault-config-operator namespace scrapes these metrics, tracking vault\_secret\_sync\_errors\_total and vault\_pki\_certificate\_expiry\_seconds.
+
+Furthermore, monitoring KMS v2 latency is critical. If the Luna HSM or Vault experiences performance degradation, OpenShift API requests involving Secrets will block, cascading into cluster-wide control plane failure. This is monitored via the OpenShift cluster-wide metric apiserver\_storage\_kms\_operations\_latency\_seconds. A latency exceeding 50ms at the P99 percentile strongly indicates HSM network congestion or Vault throttling, requiring immediate administrative intervention. Similarly, for the storage array, NetApp Harvest can be deployed outside the tenant boundary to scrape ONTAP KMIP latency metrics, ensuring storage decryption operations do not impact PostgresML inference speeds.
+
+| Cryptographic Domain | Integration Mechanism | Key Telemetry Metric (PromQL) | Threshold / SLA |
+| :---- | :---- | :---- | :---- |
+| etcd Encryption | KMS v2 via Vault & HSM | apiserver\_storage\_kms\_operations\_latency\_seconds | \< 50ms (P99) |
+| PKI / CA | Vault Secrets Operator | vault\_pki\_certificate\_expiry\_seconds | \> 72 hours remaining |
+| Service Mesh mTLS | Istio Telemetry API | istio\_tcp\_connections\_closed\_total{response\_code="503"} | Zero unauthenticated |
+| Node-to-Node | OVN-Kubernetes IPsec | ipsec\_esp\_in\_bytes / ipsec\_esp\_out\_bytes | \> 0 (Verifies IPsec active) |
+| Storage Array | ONTAP KMIP to Luna HSM | ONTAP Harvest KMIP Latency Metrics | \< 10ms response time |
+
+## **2\. Single Pane of Glass: Unified Multi-Tenant Observability**
+
+The requirement for a multi-tenant "Single Pane of Glass" introduces an architectural paradox: providing a unified interface for multiple teams to publish Service Level Indicators (SLIs), Service Level Objectives (SLOs), and dashboards, as well as viewing cluster-wide metrics (CPU, memory, disk), without compromising zero-trust isolation boundaries.
+
+To achieve this "the Red Hat way," the architecture relies on the **Cluster Observability Operator (COO)** in conjunction with the native OpenShift Web Console, abandoning standalone, disconnected community Grafana instances12.
+
+### **2.1 The Cluster Observability Operator (COO) Paradigm**
+
+The COO provides a declarative, GitOps-friendly approach to deploying monitoring stacks via the MonitoringStack Custom Resource (CR)14. By integrating directly into the OpenShift Web Console via UIPlugin resources, developers and administrators do not need to authenticate to external systems; their OpenShift Active Directory (LDAP) session dictates their visibility natively.
+
+Three primary UIPlugin resources are deployed to the openshift-cluster-observability-operator namespace:
+
+> 1. type: Monitoring (for alerts and metrics)12  
+> 2. type: Logging (for LokiStack logs)12  
+> 3. type: DistributedTracing (for TempoStack traces)12
+
+Because the OpenShift Web Console backend acts as the proxy for these plugins, it natively passes the user's OAuth token to the underlying Thanos Querier, Loki Gateway, and Tempo Gateway.
+
+To enable the UI integration, the following manifests are applied by cluster administrators:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: observability.openshift.io/v1alpha1  
+kind: UIPlugin  
+metadata:  
+&nbsp;&nbsp;name: distributed-tracing  
+spec:  
+&nbsp;&nbsp;type: DistributedTracing  
+\---  
+apiVersion: observability.openshift.io/v1alpha1  
+kind: UIPlugin  
+metadata:  
+&nbsp;&nbsp;name: logging  
+spec:  
+&nbsp;&nbsp;type: Logging  
+&nbsp;&nbsp;logging:  
+&nbsp;&nbsp;&nbsp;&nbsp;lokiStack:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;name: logging-loki  
+&nbsp;&nbsp;&nbsp;&nbsp;logsLimit: 50  
+&nbsp;&nbsp;&nbsp;&nbsp;timeout: 30s  
+&nbsp;&nbsp;&nbsp;&nbsp;schema: viaq
+
+### **2.2 Observing Compute, Acceleration, and Storage Infrastructure**
+
+The Single Pane of Glass must aggregate infrastructure telemetry critical to the AI platform's performance, specifically focusing on the CPU, GPUs, and persistent storage.
+
+**Intel NUMA Topology:** With Dual Intel Xeon 6 processors utilizing 144 cores, memory access latency is a primary concern. OpenShift's Topology Manager is set to the single-numa-node policy to prevent cross-NUMA interconnect latency during AI workloads19. If a pod requests a combination of CPU, memory, and NVIDIA GPUs that cannot be satisfied entirely within a single NUMA node, the pod admission will fail. The global pane leverages the metric kubelet\_topology\_manager\_admission\_errors\_total to alert administrators if pods are failing to schedule due to NUMA misalignment.
+
+**NVIDIA GPU Telemetry (DCGM):** The NVIDIA GPU Operator deploys the Data Center GPU Manager (DCGM) exporter. The architecture mandates GPU time-slicing to allow multiple tenants to share the 3x L4 GPUs per node3. Time-slicing differs drastically from Multi-Instance GPU (MIG). While MIG provides strict hardware-level memory and fault isolation, time-slicing relies on software-level context switching and provides absolutely no memory isolation22. All processes scheduled on a time-sliced GPU share the same global VRAM address space22.
+
+Therefore, tracking contention is vital. The global pane exposes the DCGM\_FI\_DEV\_GPU\_UTIL and DCGM\_FI\_DEV\_FB\_USED metrics24. If a specific tenant's CloudNativePG pgvector query or PostgresML inference task causes a memory out-of-bounds (OOM) error, it will be visible here as a spike in frame buffer usage leading to an eviction. Because time-slicing is used, LimitRanges and ResourceQuotas must be rigidly enforced via OpenShift RBAC to prevent one tenant's inference task from starving another's.
+
+| GPU Sharing Strategy | Hardware Isolation | VRAM Isolation | Fault Isolation | Observability Granularity |
+| :---- | :---- | :---- | :---- | :---- |
+| **MIG** | Yes (Physical partitioning) | Yes | Yes | Per-MIG instance metrics |
+| **Time-Slicing** | No (Software context switch) | No (Shared global VRAM) | No | Full-GPU aggregated metrics |
+
+**NetApp Trident CSI Telemetry:** The NetApp AFF A900 array provisions Persistent Volume Claims (PVCs) for the CloudNativePG databases. To adhere to the API limitation where developers cannot access the storage array directly, Trident telemetry bridges the gap2. Trident provides a Prometheus metrics endpoint on port 8444 (HTTPS)25. A ServiceMonitor labeled app: controller.csi.trident.netapp.io scrapes metrics such as trident\_volume\_allocated\_bytes and trident\_backend\_capacity\_bytes.
+
+While Trident metrics focus on CSI internal operations, correlating Kubernetes-native metrics like kube\_persistentvolume\_info with Trident metrics via PromQL allows administrators and developers to map a specific tenant's PVC directly to its utilization, without ever granting the tenant access to the array's proprietary management APIs2.
+
+### **2.3 Publishing SLIs, SLOs, and Dashboards**
+
+To provide a place for multiple teams to publish SLIs, SLOs, metrics, and dashboards, the architecture relies on User Workload Monitoring (UWM). UWM is enabled via the cluster-monitoring-config ConfigMap in the openshift-monitoring namespace26.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: v1  
+kind: ConfigMap  
+metadata:  
+&nbsp;&nbsp;name: cluster-monitoring-config  
+&nbsp;&nbsp;namespace: openshift-monitoring  
+data:  
+&nbsp;&nbsp;config.yaml: |  
+&nbsp;&nbsp;&nbsp;&nbsp;enableUserWorkload: true
+
+Once enabled, a dedicated Thanos Ruler instance is spun up to evaluate user-defined recording and alerting rules28. Multiple teams publish their SLIs and SLOs declaratively using the PrometheusRule Custom Resource within their own namespaces30.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: monitoring.coreos.com/v1  
+kind: PrometheusRule  
+metadata:  
+&nbsp;&nbsp;name: team-a-postgresml-slo  
+&nbsp;&nbsp;namespace: team-a-inference  
+spec:  
+&nbsp;&nbsp;groups:  
+&nbsp;&nbsp;\- name: inference-latency  
+&nbsp;&nbsp;&nbsp;&nbsp;rules:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- alert: HighInferenceLatency  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;expr: histogram\_quantile(0.95, sum(rate(http\_request\_duration\_seconds\_bucket{job="postgresml"}\[5m\])) by (le)) \> 2.5  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;for: 1m  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;labels:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;severity: critical
+
+Tenancy is cryptographically enforced at the evaluation layer. When the Thanos Ruler evaluates a PrometheusRule, it automatically forces the namespace="team-a-inference" label into the PromQL expression30. This ensures that Team A's alerts cannot accidentally trigger based on Team B's workload metrics, and prevents malicious metric spoofing across boundaries.
+
+For dashboards, while the native OpenShift Developer perspective provides robust charting, teams requiring complex visualizations can utilize the Community Grafana Operator to deploy isolated Grafana instances within their namespaces. These instances use a GrafanaDatasource that authenticates against the Thanos Querier via a service account token bound to the specific namespace, ensuring the dashboards only render data authorized for that team15.
+
+## **3\. Application Team Pane of Glass: Single-Tenant Isolation**
+
+The Application Team Pane of Glass is strictly scoped to a single tenant namespace. A developer in team-a-inference must seamlessly view their metrics, application logs, and distributed traces, while being cryptographically and logically barred from observing team-b-inference or infrastructure components.
+
+### **3.1 Single-Tenant Metrics: CloudNativePG and pgvector**
+
+To collect metrics from CloudNativePG and the embedded AI extensions, UWM is heavily utilized. CloudNativePG instances export Prometheus metrics natively on port 918732. The application team deploys a PodMonitor inside their namespace:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: monitoring.coreos.com/v1  
+kind: PodMonitor  
+metadata:  
+&nbsp;&nbsp;name: team-a-cnpg-monitor  
+&nbsp;&nbsp;namespace: team-a-inference  
+spec:  
+&nbsp;&nbsp;selector:  
+&nbsp;&nbsp;&nbsp;&nbsp;matchLabels:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cnpg.io/cluster: team-a-db  
+&nbsp;&nbsp;podMetricsEndpoints:  
+&nbsp;&nbsp;\- port: metrics
+
+Note: The older .spec.monitoring.enablePodMonitor field in the CloudNativePG Cluster CR is deprecated; declarative PodMonitor resources are the vendor-recommended best practice34.
+
+For pgvector specific metrics, developers can define custom SQL queries in a ConfigMap or Secret referenced by the customQueriesConfigMap section of the CNPG cluster definition35. This allows the team to track vector index sizes (e.g., HNSW or IVFFlat indices) and PostgresML model inference lag directly in Prometheus.
+
+When a developer queries the OpenShift UI (via the COO Monitoring UIPlugin), the Thanos Querier intercepts the request. The developer's OAuth token is evaluated against OpenShift RBAC. Because the developer only has view or admin role bindings in team-a-inference, Thanos automatically appends the namespace="team-a-inference" label matcher to the underlying PromQL query, fulfilling the strict isolation requirement30.
+
+### **3.2 Single-Tenant Logs: LokiStack and OPA Authorization**
+
+OpenShift Logging utilizes a Vector collector deployed as a DaemonSet to gather container logs, forwarding them to a LokiStack backed by the NetApp AFF A900 array's S3 object storage compatibility layer37.
+
+While Loki natively supports multi-tenancy, standard open-source Loki relies on a static X-Scope-OrgID HTTP header injected by the client. To align with "the Red Hat way" and integrate seamlessly with OpenShift RBAC, the LokiStack CR is configured with tenants.mode: openshift-logging39.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: loki.grafana.com/v1  
+kind: LokiStack  
+metadata:  
+&nbsp;&nbsp;name: logging-loki  
+&nbsp;&nbsp;namespace: openshift-logging  
+spec:  
+&nbsp;&nbsp;size: 1x.small  
+&nbsp;&nbsp;storage:  
+&nbsp;&nbsp;&nbsp;&nbsp;schemas:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- version: v13  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;effectiveDate: "2024-01-01"  
+&nbsp;&nbsp;&nbsp;&nbsp;secret:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;name: logging-loki-s3  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;type: s3  
+&nbsp;&nbsp;tenants:  
+&nbsp;&nbsp;&nbsp;&nbsp;mode: openshift-logging
+
+This specific deployment mode instantiates the LokiStack Gateway, an intelligent reverse proxy positioned in front of the Loki Query Frontend. The Gateway integrates an Open Policy Agent (OPA) sidecar (opa-openshift)39. When a log query arrives from the OpenShift Web Console, the Gateway extracts the user's identity and translates the authorization request via the OPA sidecar into a SubjectAccessReview executed directly against the OpenShift API server39.
+
+### **3.3 Single-Tenant Traces: TempoStack and OpenTelemetry**
+
+Distributed tracing is essential for debugging Service Mesh traffic and PostgresML inference pipelines, especially when identifying latency bottlenecks in pgvector similarity searches. Tracing is provided by TempoStack, paired with the OpenTelemetry (OTel) Collector41.
+
+Similar to Loki, TempoStack is configured with tenants.mode: openshift41. The application teams instrument their code with OpenTelemetry SDKs, configured to send OTLP data to a central OTel Collector managed by the Red Hat build of OpenTelemetry.
+
+The central OTel Collector utilizes a routing processor to inspect the k8s.namespace.name attribute attached to the incoming spans. It dynamically injects the correct X-Scope-OrgID header corresponding to the tenant before forwarding the data to the Tempo Gateway43. This pipeline ensures that traces generated in team-a-inference are permanently tagged and routed to Team A's tenant storage, making cross-tenant data contamination impossible at the ingestion layer.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+\# Example OpenTelemetry Collector Routing Configuration  
+receivers:  
+&nbsp;&nbsp;otlp:  
+&nbsp;&nbsp;&nbsp;&nbsp;protocols:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;grpc:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;http:  
+processors:  
+&nbsp;&nbsp;routing/traces:  
+&nbsp;&nbsp;&nbsp;&nbsp;default\_pipelines:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- traces/Default  
+&nbsp;&nbsp;&nbsp;&nbsp;table:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- statement: route() where attributes\["k8s.namespace.name"\] \== "team-a-inference"  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;pipelines:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- traces/team-a
+
+### **3.4 Step-by-Step Verification Process: Preventing Cross-Tenant Data Leakage**
+
+To satisfy the strict security requirement of ensuring Team A cannot read Team B's telemetry, the following step-by-step cryptographic and logical verification process must be executed and audited by the security architecture team:
+
+**Step 1: Network Policy Verification (Zero-Trust L3/L4)**
+
+> 1. Open a terminal session into a running application pod within the team-a-inference namespace.  
+> 2. Execute a curl command attempting to bypass the Gateways and reach the Loki or Tempo backend distributors directly on port 3100 or 4317\. *Result:* The connection will time out. OpenShift default-deny NetworkPolicies enforce zero-trust posture, preventing cross-namespace communication to backend data stores44. All telemetry queries must traverse the authenticated Gateways (LokiStack Gateway / Tempo Gateway).
+
+**Step 2: SubjectAccessReview (SAR) Verification (L7 API)**
+
+> 1. Extract a valid OAuth Bearer token for a developer belonging to team-a-inference.  
+> 2. Attempt to query the LokiStack Gateway API manually via curl, intentionally requesting logs for Team B:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+Bash
+
+curl \-G \-H "Authorization: Bearer $TEAM\_A\_TOKEN" \\  
+"https://logging-loki-gateway.openshift-logging.svc/api/logs/v1/application/loki/api/v1/query\_range" \\  
+\--data-urlencode 'query={kubernetes\_namespace\_name="team-b-inference"}'
+
+*Result:* The LokiStack Gateway forwards the Bearer token to the opa-openshift sidecar. The OPA sidecar translates the request into a Kubernetes SubjectAccessReview39. It asks the OpenShift API: *"Does the user owning this token have 'get' permissions on 'pods/log' in the namespace 'team-b-inference'?"* The OpenShift API responds false. OPA immediately rejects the request with an HTTP 403 Forbidden39.
+
+**Step 3: PromQL/LogQL AST Injection Verification**
+
+> 1. Using the same Team A token, attempt a broad, non-namespace-specific query: {log\_type="application"}.  
+>    *Result:* OPA evaluates the user's RBAC. Discovering the user only has access to team-a-inference, the Loki Gateway dynamically rewrites the query at the Abstract Syntax Tree (AST) level before passing it to the Query Frontend. The executed query transparently becomes {log\_type="application", kubernetes\_namespace\_name="team-a-inference"}. Cross-tenant leakage is mathematically impossible without compromising the Kubernetes API server itself.
+
+## **4\. Cluster Administrators Pane of Glass**
+
+The Cluster Administrators Pane of Glass provides absolute visibility over the environment, bypassing tenant namespace restrictions to monitor the health of the hardware, the service mesh, and cryptographic boundaries.
+
+### **4.1 Service Mesh 3.0 (Istio) and Kiali Telemetry**
+
+OpenShift Service Mesh 3.0 (managed via the Sail Operator) marks a significant departure from previous versions, moving away from the Maistra fork to upstream Istio46. This ensures that the platform receives upstream updates rapidly while maintaining enterprise support46.
+
+For global traffic observability, the Kiali Operator is deployed independently of the mesh10. Kiali provides a real-time visual service graph of the entire cluster. In a zero-trust environment, monitoring mutual TLS (mTLS) compliance is critical. Istio is configured with PeerAuthentication set to STRICT globally. Kiali visually highlights any unencrypted edge (which should be non-existent), verifying that all pod-to-pod traffic relies on the certificates issued by the HashiCorp Vault Intermediate CA10.
+
+Administrators configure the new Istio Telemetry API (apiVersion: telemetry.istio.io/v1) rather than the legacy MeshConfig48. This declarative API defines trace sampling rates, Prometheus metric providers, and access logging at the cluster scope, overcoming the lack of dynamism in older configurations49.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: telemetry.istio.io/v1  
+kind: Telemetry  
+metadata:  
+&nbsp;&nbsp;name: mesh-default  
+&nbsp;&nbsp;namespace: istio-system  
+spec:  
+&nbsp;&nbsp;tracing:  
+&nbsp;&nbsp;\- randomSamplingPercentage: 10.00  
+&nbsp;&nbsp;metrics:  
+&nbsp;&nbsp;\- providers:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- name: prometheus
+
+**Architectural Decision: Sidecar vs. Ambient Mode** While Service Mesh 3.0 introduces Istio Ambient Mode (utilizing ztunnel and waypoint proxies)50, a strictly isolated multi-tenant architecture relying on L7 AuthorizationPolicies currently favors the standard Sidecar (Envoy) model.
+
+Ambient mode requires deploying the ztunnel DaemonSet with NET\_ADMIN and privileged Security Context Constraints (SCC) across all host nodes52. In a highly regulated environment, relying on sidecars keeps the cryptographic boundary (mTLS termination) strictly inside the unprivileged tenant pod network namespace, mitigating the blast radius of a potential node-level ztunnel compromise51.
+
+| Feature / Requirement | Istio Sidecar (Envoy) | Istio Ambient Mode (ztunnel) | Recommendation for Zero-Trust |
+| :---- | :---- | :---- | :---- |
+| **mTLS Termination** | In-pod network namespace | Node-level DaemonSet | Sidecar (Stronger boundary) |
+| **L7 Authorization** | Local Envoy proxy | Remote Waypoint proxy | Sidecar (Less network hops) |
+| **Host Privileges** | Unprivileged SCC | NET\_ADMIN / Privileged SCC | Sidecar (Least privilege) |
+| **Resource Overhead** | High (CPU/Mem per pod) | Low (Shared ztunnel) | Acceptable trade-off for security |
+
+### **4.2 Application Teams Read-Only Access Options and Risks**
+
+A common requirement is evaluating whether application developers can be granted read-only access to the Administrative Kiali Pane or a cluster-wide dashboard to troubleshoot routing.
+
+**Options & Feasibility:** Kiali can be configured in a multi-tenant mode by setting deployment.cluster\_wide\_access: false and enabling the require\_namespace\_get: true feature flag36. When enabled, Kiali performs individual SubjectAccessReview checks for every namespace, only visualizing nodes where the user has get permissions36.
+
+**Risk Analysis (Unreasonable Burden):**
+
+While technically feasible, offering multi-tenant Kiali imposes a severe administrative burden and introduces a high risk of information leakage.
+
+> 1. **Topology Leakage:** If Istio Telemetry captures cross-namespace requests (e.g., Team A accidentally attempting to call Team B and being rejected by an AuthorizationPolicy), visualizing that edge in Team A's Kiali graph exposes the existence, naming conventions, and IP metadata of Team B's internal services.  
+> 2. **Performance Degradation:** Setting cluster\_wide\_access: false forces the Kiali Server to watch individual namespaces rather than using a highly efficient cluster-wide API watch53. In an AI platform with hundreds of tenant namespaces, this creates massive API server churn and high CPU consumption on the Kiali pods, degrading control plane performance53.
+
+**Feasibility Verdict:** Unsupported/Unreasonable Burden. Application teams should rely exclusively on the COO Distributed Tracing UIPlugin (TempoStack) for debugging intra-namespace request flows, which natively enforces multi-tenant boundaries via OpenTelemetry trace IDs12.
+
+### **4.3 Administrators Access to Application Panes Options and Risks**
+
+Conversely, can administrators view application-level data (logs, traces, custom metrics) within the tenant panes?
+
+**Options & Feasibility:**
+
+By default, OpenShift users with the cluster-admin ClusterRole possess get permissions on all namespaces and pods/log resources. Consequently, the Thanos Querier, Loki Gateway, and Tempo Gateway will grant administrators unfettered access to all tenant data across all Panes of Glass automatically.
+
+**Risk Analysis:**
+
+This represents a significant compliance and data governance risk in a multi-tenant environment.
+
+> 1. **PII/PHI Leakage:** AI inference models (e.g., PostgresML tasks running inside CloudNativePG) may process highly sensitive user prompts, proprietary datasets, or Personally Identifiable Information (PII). If an application crashes, stack traces sent to LokiStack or payload data attached to OpenTelemetry spans in TempoStack may contain this sensitive data in plain text.  
+> 2. **Violation of Least Privilege:** A platform infrastructure administrator is responsible for the uptime of OpenShift, NetApp, and the NVIDIA GPUs. They have no operational need to read the specific pgvector similarity queries executed by Team A.
+
+**Feasibility Verdict:** Implementable, but requires Data Obfuscation and RBAC tuning.
+
+To mitigate these risks:
+
+> 1. **Log Masking:** Leverage Vector's Remap Language (VRL) at the collector level to automatically mask recognized patterns (e.g., credit cards, UK National Insurance numbers, email addresses) before the logs are committed to the NetApp S3 storage37.  
+> 2. **Custom Admin Roles:** Do not use the default cluster-admin role for daily operations. Create a custom platform-operator ClusterRole that grants permissions over nodes, storage classes, and istio-system namespaces, but explicitly denies pods/log and pods/exec access in tenant namespaces. This prevents the COO plugins from rendering application logs and traces to infrastructure engineers, while preserving their ability to monitor node health and hardware metrics.
+
+| Access Scenario | Feasibility | Risk Level | Architectural Recommendation |
+| :---- | :---- | :---- | :---- |
+| **App Team → Admin Pane (Kiali)** | Technically Possible | High (Topology Leakage, API Churn) | **Reject.** Rely on Distributed Tracing instead. |
+| **Admin Team → App Pane (Logs)** | Default Behavior | High (PII/PHI Exposure) | **Mitigate.** Use custom RBAC and Vector VRL masking. |
+
+## **5\. Conclusion**
+
+Designing an observability stack for a zero-trust, multi-tenant AI platform in the United Kingdom requires balancing exhaustive data collection with uncompromising cryptographic access enforcement. By adhering to "the Red Hat way" and leveraging the integration of HSM-backed Vault encryption, OpenShift Service Mesh 3.0, and the Cluster Observability Operator, the platform achieves both high performance and strict isolation.
+
+To ensure long-term stability and security, the following architectural mandates must be observed:
+
+First, mandate the use of the Cluster Observability Operator (COO) UIPlugins over external dashboards. Bypassing the OPA and OpenShift OAuth proxy mechanisms inherent in the COO UIPlugins will inevitably lead to cross-tenant data leaks.
+
+Second, meticulously monitor cryptographic latency. The HashiCorp Vault and Luna HSM integration secures the entire stack. Implement strict Prometheus alerting on apiserver\_storage\_kms\_operations\_latency\_seconds; a failure here cascades into widespread OpenShift API failures and Service Mesh mTLS outages.
+
+Third, acknowledge AI hardware constraints. Utilize the DCGM exporter to monitor NVIDIA L4 time-slicing continuously. Because time-slicing lacks memory isolation, configure rigid LimitRanges and ResourceQuotas per namespace to prevent rogue AI workloads from causing global out-of-memory GPU evictions.
+
+Finally, retain the Envoy Sidecar architecture for OpenShift Service Mesh. Avoid Ambient Mode in this specific multi-tenant use case until the security posture of running privileged ztunnel DaemonSets is fully reconciled with the organization's zero-trust compliance mandates.
+
+#### **Works cited**
+
+> 1. How to Deploy NetApp Trident for Enterprise Storage Integration on, [https://oneuptime.com/blog/post/2026-02-09-netapp-trident-enterprise-storage/view](https://oneuptime.com/blog/post/2026-02-09-netapp-trident-enterprise-storage/view)  
+> 2. Add more info to Prometheus metrics · Issue \#486 · NetApp/trident, [https://github.com/NetApp/trident/issues/486](https://github.com/NetApp/trident/issues/486)  
+> 3. Chapter 8\. About GPU time slicing \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_ai\_self-managed/3.3/html/working\_with\_accelerators/about-gpu-time-slicing\_accelerators](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.3/html/working_with_accelerators/about-gpu-time-slicing_accelerators)  
+> 4. OpenShift Container Platform \- Thales Docs, [https://thalesdocs.com/gphsm/integrations/guides/openshift\_container\_platform/index.html](https://thalesdocs.com/gphsm/integrations/guides/openshift_container_platform/index.html)  
+> 5. RedHat OpenShift Luna HSM Operator \- Integration Guide \- Thales, [https://cpl.thalesgroup.com/resources/encryption/redhat-openshift-lunaHSM-integration-guide](https://cpl.thalesgroup.com/resources/encryption/redhat-openshift-lunaHSM-integration-guide)  
+> 6. HashiCorp Vault \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp\_vault/index.html](https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp_vault/index.html)  
+> 7. Kubernetes Secrets Encryption \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/kubernetes\_secrets\_encryption/](https://www.thalesdocs.com/gphsm/integrations/guides/kubernetes_secrets_encryption/)  
+> 8. A Holistic approach to encrypting secrets, both on and off ... \- Red Hat, [https://www.redhat.com/en/blog/holistic-approach-to-encrypting-secrets-both-on-and-off-your-openshift-clusters](https://www.redhat.com/en/blog/holistic-approach-to-encrypting-secrets-both-on-and-off-your-openshift-clusters)  
+> 9. Integrate Vault PKI with Vault Secrets Operator (VSO) on OpenShift, [https://developer.hashicorp.com/validated-patterns/vault/vault-pki-with-vso-and-openshift](https://developer.hashicorp.com/validated-patterns/vault/vault-pki-with-vso-and-openshift)  
+> 10. OpenShift Service Mesh 3: what changes with Istio \- Rafael Zago, [https://www.rafaelvzago.com/en/posts/openshift-service-mesh-3/](https://www.rafaelvzago.com/en/posts/openshift-service-mesh-3/)  
+> 11. How to Secure Cloud-Native Applications With HashiCorp Vault and, [https://www.redhat.com/en/blog/how-to-secure-cloud-native-applications-with-hashicorp-vault-and-cert-manager](https://www.redhat.com/en/blog/how-to-secure-cloud-native-applications-with-hashicorp-vault-and-cert-manager)  
+> 12. observability-ui-plugins.md \- GitHub, [https://github.com/rhobs/observability-operator/blob/main/docs/user-guides/observability-ui-plugins.md](https://github.com/rhobs/observability-operator/blob/main/docs/user-guides/observability-ui-plugins.md)  
+> 13. Get started with the OpenShift Cluster Observability Operator, [https://developers.redhat.com/articles/2024/07/09/get-started-openshift-cluster-observability-operator](https://developers.redhat.com/articles/2024/07/09/get-started-openshift-cluster-observability-operator)  
+> 14. Cluster Observability Operator overview \- OKD Documentation, [https://docs.okd.io/4.19/observability/cluster\_observability\_operator/cluster-observability-operator-overview.html](https://docs.okd.io/4.19/observability/cluster_observability_operator/cluster-observability-operator-overview.html)  
+> 15. Monitoring AAP 2.5+ on OpenShift, Part 2: the Cluster Observability, [https://medium.com/@yakovbeder/monitoring-aap-2-5-on-openshift-part-2-the-cluster-observability-operator-path-ce454719d75f](https://medium.com/@yakovbeder/monitoring-aap-2-5-on-openshift-part-2-the-cluster-observability-operator-path-ce454719d75f)  
+> 16. Chapter 2\. Monitoring UI plugin \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_cluster\_observability\_operator/1-latest/html/ui\_plugins\_for\_red\_hat\_openshift\_cluster\_observability\_operator/monitoring-ui-plugin](https://docs.redhat.com/en/documentation/red_hat_openshift_cluster_observability_operator/1-latest/html/ui_plugins_for_red_hat_openshift_cluster_observability_operator/monitoring-ui-plugin)  
+> 17. Openshift Observability: Configuring Logging | by Fabio Reis \- Medium, [https://fabreur.medium.com/openshift-observability-configuring-logging-1b149ecd25c7](https://fabreur.medium.com/openshift-observability-configuring-logging-1b149ecd25c7)  
+> 18. UI plugins for Red Hat OpenShift Cluster Observability Operator, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_cluster\_observability\_operator/latest/epub/ui\_plugins\_for\_red\_hat\_openshift\_cluster\_observability\_operator](https://docs.redhat.com/en/documentation/red_hat_openshift_cluster_observability_operator/latest/epub/ui_plugins_for_red_hat_openshift_cluster_observability_operator)  
+> 19. Control Topology Management Policies on a node \- Kubernetes, [https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)  
+> 20. Using CPU Manager and Topology Manager \- OKD Documentation, [https://docs.okd.io/4.18/scalability\_and\_performance/using-cpu-manager.html](https://docs.okd.io/4.18/scalability_and_performance/using-cpu-manager.html)  
+> 21. Time-slicing NVIDIA GPUs in OpenShift, [https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/time-slicing-gpus-in-openshift.html](https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/time-slicing-gpus-in-openshift.html)  
+> 22. Beyond Partitioning: A Deep Dive into NVIDIA GPU Time-Slicing, [https://sagar-parmar.medium.com/beyond-partitioning-a-deep-dive-into-nvidia-gpu-time-slicing-533705821f0d](https://sagar-parmar.medium.com/beyond-partitioning-a-deep-dive-into-nvidia-gpu-time-slicing-533705821f0d)  
+> 23. Comparing Multi-Instance GPU (MIG) and Time-Slicing ... \- OpenMetal, [https://openmetal.io/resources/blog/mig-vs-time-slicing-gpu-sharing/](https://openmetal.io/resources/blog/mig-vs-time-slicing-gpu-sharing/)  
+> 24. GPU Operator Time-Slicing and MIG: Kubernetes Sharing Tutorial, [https://perlod.com/tutorials/share-nvidia-gpus-kubernetes/](https://perlod.com/tutorials/share-nvidia-gpus-kubernetes/)  
+> 25. Monitor Trident \- NetApp Docs, [https://docs.netapp.com/us-en/trident/trident-use/monitor-trident.html](https://docs.netapp.com/us-en/trident/trident-use/monitor-trident.html)  
+> 26. pittar/openshift-user-workload-monitoring \- GitHub, [https://github.com/pittar/openshift-user-workload-monitoring](https://github.com/pittar/openshift-user-workload-monitoring)  
+> 27. Enable User Workload Monitoring OpenShift | K8s Recipes, [https://kubernetes.recipes/recipes/observability/openshift-user-workload-monitoring/](https://kubernetes.recipes/recipes/observability/openshift-user-workload-monitoring/)  
+> 28. openshift-user-workload-monitoring.md \- Gist \- GitHub, [https://gist.github.com/jeesmon/e6ffe4b3f2e00f0ebf61bf5ad18a70d5](https://gist.github.com/jeesmon/e6ffe4b3f2e00f0ebf61bf5ad18a70d5)  
+> 29. Monitoring Applications in OpenShift using Prometheus, [https://michaelkotelnikov.medium.com/monitoring-services-in-openshift-using-prometheus-25a7fe81f3a9](https://michaelkotelnikov.medium.com/monitoring-services-in-openshift-using-prometheus-25a7fe81f3a9)  
+> 30. user-workload-monitoring.md \- openshift/enhancements \- GitHub, [https://github.com/openshift/enhancements/blob/master/enhancements/monitoring/user-workload-monitoring.md](https://github.com/openshift/enhancements/blob/master/enhancements/monitoring/user-workload-monitoring.md)  
+> 31. User Workload Monitoring · OpenShift Demo, [https://rhthsa.github.io/openshift-demo/application-metrics.html](https://rhthsa.github.io/openshift-demo/application-metrics.html)  
+> 32. Monitoring \- CloudNativePG, [https://cloudnative-pg.io/documentation/1.17/monitoring/](https://cloudnative-pg.io/documentation/1.17/monitoring/)  
+> 33. Monitoring v2.0.1 \- EDB, [https://www.enterprisedb.com/docs/postgres\_distributed\_for\_kubernetes/latest/monitoring/](https://www.enterprisedb.com/docs/postgres_distributed_for_kubernetes/latest/monitoring/)  
+> 34. Monitoring | CloudNativePG, [https://cloudnative-pg.github.io/docs/1.27/monitoring/](https://cloudnative-pg.github.io/docs/1.27/monitoring/)  
+> 35. CloudNativePG \- Grafana Labs, [https://grafana.com/grafana/dashboards/20417-cloudnativepg/](https://grafana.com/grafana/dashboards/20417-cloudnativepg/)  
+> 36. Namespace access control \- Kiali, [https://kiali.io/docs/configuration/rbac/](https://kiali.io/docs/configuration/rbac/)  
+> 37. OpenShift Logging: A Quickstart Guide with Loki Stack, [https://www.opensourcerers.org/2025/07/21/openshift-logging-a-quickstart-guide-with-loki-stack/](https://www.opensourcerers.org/2025/07/21/openshift-logging-a-quickstart-guide-with-loki-stack/)  
+> 38. How to Configure Centralized Logging in OpenShift with LokiStack, [https://kifarunix.com/configure-centralized-logging-in-openshift-with-lokistack-and-odf/](https://kifarunix.com/configure-centralized-logging-in-openshift-with-lokistack-and-odf/)  
+> 39. loki-gateway-configuration.md \- GitHub, [https://github.com/openshift/enhancements/blob/master/enhancements/cluster-logging/loki-gateway-configuration.md](https://github.com/openshift/enhancements/blob/master/enhancements/cluster-logging/loki-gateway-configuration.md)  
+> 40. Logging | OpenShift Container Platform \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.14/observability/logging/openshift-logging-common-terms](https://docs.redhat.com/en/documentation/openshift_container_platform/4.14/observability/logging/openshift-logging-common-terms)  
+> 41. Tempostack with Multitenant and RBAC | by Fabio Reis \- Medium, [https://fabreur.medium.com/1-overview-e27f29d3adb7](https://fabreur.medium.com/1-overview-e27f29d3adb7)  
+> 42. Chapter 3\. Distributed tracing and Service Mesh | Observability, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_service\_mesh/3.3/html/observability/distributed-tracing-and-service-mesh](https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.3/html/observability/distributed-tracing-and-service-mesh)  
+> 43. The Hitchhiker's Guide to Observability \- Adding A New Tenant \- Part 6, [https://blog.stderr.at/openshift-platform/observability/observability/2025-11-28-hitchhikers-guide-to-distributed-tracing-with-opentelemetry-and-tempostack-part6/](https://blog.stderr.at/openshift-platform/observability/observability/2025-11-28-hitchhikers-guide-to-distributed-tracing-with-opentelemetry-and-tempostack-part6/)  
+> 44. Deploy multi-tenant Red Hat OpenShift clusters with Calico's, [https://www.tigera.io/blog/deep-dive/deploy-multi-tenant-red-hat-openshift-clusters-with-calicos-namespace-and-workload-isolation/](https://www.tigera.io/blog/deep-dive/deploy-multi-tenant-red-hat-openshift-clusters-with-calicos-namespace-and-workload-isolation/)  
+> 45. How to Handle Logging and Tracing for Multi-Tenant Kubernetes, [https://blog.nashtechglobal.com/how-to-handle-logging-and-tracing-for-multi-tenant-kubernetes-clusters-using-capsule-and-loki/](https://blog.nashtechglobal.com/how-to-handle-logging-and-tracing-for-multi-tenant-kubernetes-clusters-using-capsule-and-loki/)  
+> 46. Introducing Red Hat OpenShift Service Mesh 3.0, [https://www.redhat.com/en/blog/introducing-red-hat-openshift-service-mesh-3](https://www.redhat.com/en/blog/introducing-red-hat-openshift-service-mesh-3)  
+> 47. OpenShift Service Mesh: Unleashing the Power of Microservices, [https://meatybytes.io/posts/openshift/ocp-features/service-mesh/rh-service-mesh-fundamentals/](https://meatybytes.io/posts/openshift/ocp-features/service-mesh/rh-service-mesh-fundamentals/)  
+> 48. Telemetry \- Istio, [https://istio.io/latest/docs/reference/config/telemetry/](https://istio.io/latest/docs/reference/config/telemetry/)  
+> 49. Migrating from MeshConfig to Istio Telemetry API \- Jimmy Song, [https://jimmysong.io/blog/migrate-to-istio-telemetry-api/](https://jimmysong.io/blog/migrate-to-istio-telemetry-api/)  
+> 50. Quickstart \- Ambient Mesh, [https://ambientmesh.io/docs/quickstart/](https://ambientmesh.io/docs/quickstart/)  
+> 51. Introducing Ambient Mesh \- Istio, [https://istio.io/latest/blog/2022/introducing-ambient-mesh/](https://istio.io/latest/blog/2022/introducing-ambient-mesh/)  
+> 52. Ambient support for redhat openshift · Issue \#42341 \- GitHub, [https://github.com/istio/istio/issues/42341](https://github.com/istio/istio/issues/42341)  
+> 53. Namespace Management \- Kiali, [https://kiali.io/docs/configuration/namespace-management/](https://kiali.io/docs/configuration/namespace-management/)

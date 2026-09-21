@@ -1,0 +1,340 @@
+# **Zero-Trust Multi-Tenant AI Platform: Technical Validation**
+
+The deployment of a zero-trust, multi-tenant artificial intelligence platform on bare-metal infrastructure requires a meticulous alignment of cryptographic trust chains, hardware acceleration topologies, and orchestrator-level network isolation. The proposed stack integrates high-density compute, inference-optimized accelerators, enterprise storage, and Red Hat OpenShift, secured by HashiCorp Vault and Thales Luna Hardware Security Modules (HSMs). This architecture represents a highly converged state where cryptographic boundaries must intersect fluidly with container-native orchestration without degrading the rigorous performance profiles demanded by vector databases and large language model inference.
+
+The physical foundation relies on the HPE ProLiant Compute DL380 Gen12 platform, powered by dual Intel Xeon 6 processors providing 144 total cores and 4TB of DDR5 RAM1. Acceleration is delivered via three NVIDIA L4 Tensor Core GPUs, utilizing the Ada Lovelace architecture to provide high-density, low-power inference1. Persistent data is housed on a NetApp AFF A900 array, orchestrated through the Astra Trident Container Storage Interface (CSI) using the ontap-san backend4. Orchestration and isolation are governed by Red Hat OpenShift, deploying CloudNativePG (CNPG) with the pgvector extension for distributed embedding storage, while Red Hat Advanced Cluster Security (RHACS) and OpenShift Service Mesh (Istio) enforce runtime and transit security6.
+
+This comprehensive technical analysis validates the hardware-software interoperability, traces the cryptographic key lifecycles, and evaluates the profound performance implications of deep multi-tenancy, specifically focusing on the intersection of Non-Uniform Memory Access (NUMA) boundaries, GPU time-slicing overhead, and strict OpenShift security constructs.
+
+## **Compatibility and Firmware Validation Matrix**
+
+The integration of 6th Generation Intel Xeon processors, Ada Lovelace GPUs, and FIPS-validated Red Hat Enterprise Linux CoreOS (RHCOS) introduces specific firmware, driver, and orchestration dependencies that must be resolved prior to cluster bootstrapping.
+
+### **Hardware and OS Layer Compatibility**
+
+The HPE ProLiant DL380 Gen12 server operates on a PCIe Gen5 bus architecture and relies on the iLO 6 management controller for its Silicon Root of Trust1. Red Hat OpenShift, relying on RHCOS 9.x for its latest releases, provides native support for this hardware. However, several critical compatibility intersections dictate the configuration parameters.
+
+OpenShift deployments utilizing RHCOS 9.x operate under FIPS 140-3 cryptographic modules9. To maintain the integrity of the cryptographic boundary, the fips: true flag must be declared in the install-config.yaml file during initial cluster bootstrapping10. This action forces the Red Hat Enterprise Linux kernel to disable non-approved algorithms and enforce the exclusive use of validated implementations, such as the OpenSSL FIPS provider and the Kernel Cryptographic API9.
+
+Furthermore, Red Hat Advanced Cluster Security (RHACS) utilizes Extended Berkeley Packet Filter (eBPF) probes for runtime security and real-time system call monitoring7. Because RHCOS 9.x kernels evolve rapidly, the RHACS Collector DaemonSet must dynamically load eBPF probes that exactly match the kernel version of the HPE worker nodes14. If the nodes are deployed in a heavily restricted or air-gapped network, the specific eBPF probes for the RHCOS kernel must be downloaded and mirrored into the internal registry prior to RHACS deployment, otherwise runtime visibility will fail.
+
+### **Intel NUMA Architecture and Kubelet Alignment**
+
+The dual-socket Intel Xeon 6 platform presents distinct NUMA boundaries. When a pod is allocated CPU cycles from Socket 0 but must access memory or a PCIe device attached to Socket 1, the data must traverse the Intel Ultra Path Interconnect (UPI). This cross-socket traversal introduces latency penalties that can degrade inference throughput by up to 30%16. To mitigate this, OpenShift's Topology Manager must be configured to ensure strict hardware alignment.
+
+The NVIDIA GPU Operator passes the 3x NVIDIA L4 GPUs to the container runtime3. For the Linux kernel and the Kubernetes scheduler to recognize the physical topology of these devices relative to the CPUs and NICs, the KubeletConfig must enforce a single-numa-node policy16.
+
+This is achieved by applying a KubeletConfig custom resource targeting the machineconfiguration.openshift.io/role: worker MachineConfigPool:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: machineconfiguration.openshift.io/v1  
+kind: KubeletConfig  
+metadata:  
+&nbsp;&nbsp;name: numatuning-worker  
+spec:  
+&nbsp;&nbsp;machineConfigPoolSelector:  
+&nbsp;&nbsp;&nbsp;&nbsp;matchLabels:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;machineconfiguration.openshift.io/role: worker  
+&nbsp;&nbsp;kubeletConfig:  
+&nbsp;&nbsp;&nbsp;&nbsp;cpuManagerPolicy: static  
+&nbsp;&nbsp;&nbsp;&nbsp;topologyManagerPolicy: single-numa-node  
+&nbsp;&nbsp;&nbsp;&nbsp;topologyManagerScope: pod
+
+The cpuManagerPolicy: static setting is a prerequisite for NUMA pinning, allowing pods with integer CPU requests (Guaranteed Quality of Service) to gain exclusive access to physical cores16. The single-numa-node policy instructs the kubelet to interrogate the Hint Providers (CPU Manager and Device Manager) and strictly reject any pod if its requested resources cannot be satisfied entirely within a single NUMA boundary16.
+
+### **NVIDIA L4 GPU Driver and Time-Slicing Constraints**
+
+The NVIDIA L4 GPU operates on the Ada Lovelace architecture, presenting 24GB of GDDR6 VRAM with a 72W Thermal Design Power (TDP) over a PCIe Gen4 x16 interface1. Because the HPE DL380 Gen12 supports PCIe Gen5, the bus will safely auto-negotiate down to Gen4 speeds, providing 64 GB/s of bidirectional bandwidth per accelerator1.
+
+A critical architectural constraint is that the NVIDIA L4 does not support Multi-Instance GPU (MIG) hardware partitioning3. To achieve the multi-tenancy requirement of 18 PostgreSQL pods across 3 physical GPUs, the NVIDIA GPU Operator must be configured for temporal oversubscription via CUDA time-slicing3. Time-slicing allows multiple CUDA contexts to share the GPU by interleaving execution sequentially, switching contexts every few milliseconds20.
+
+This requires the deployment of a specific ConfigMap within the GPU Operator namespace to rename and replicate the nvidia.com/gpu resource. Because there are 3 physical GPUs and 18 pods are required, each GPU must be oversubscribed by a factor of 6:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: v1  
+kind: ConfigMap  
+metadata:  
+&nbsp;&nbsp;name: time-slicing-config  
+&nbsp;&nbsp;namespace: nvidia-gpu-operator  
+data:  
+&nbsp;&nbsp;any: |-  
+&nbsp;&nbsp;&nbsp;&nbsp;version: v1  
+&nbsp;&nbsp;&nbsp;&nbsp;sharing:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;timeSlicing:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;resources:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- name: nvidia.com/gpu  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;replicas: 6
+
+Once applied and referenced in the ClusterPolicy, the kubelet will advertise 18 allocatable nvidia.com/gpu resources per node, allowing the Kubernetes scheduler to place all 18 CloudNativePG pods concurrently17. The NVIDIA proprietary driver (branch 535 or later) deployed by the operator natively handles the CUDA context switching24.
+
+### **NetApp ONTAP and Trident CSI Integration**
+
+The NetApp AFF A900 array interfaces with OpenShift via the Astra Trident CSI driver5. The architectural specification mandates that all Persistent Volume Claims (PVCs) reside on the storage array, with end-users restricted from accessing array management APIs5.
+
+For database workloads such as PostgresML, block storage (ontap-san) is vastly superior to file storage (ontap-nas) due to the elimination of network filesystem locking overhead4. Trident supports both iSCSI and NVMe/TCP for the ontap-san driver5. NVMe/TCP is recommended to reduce CPU interrupt overhead on the host5.
+
+A known engineering constraint with Trident on OpenShift involves Linux multipathing. The /etc/multipath.conf file on all worker nodes must be explicitly configured to prevent local NVMe or host drives from being incorrectly claimed by the multipath daemon, which causes mount failures during node reboots27. The configuration must enforce find\_multipaths no. This must be injected via a MachineConfig object before the Trident operator is deployed:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: machineconfiguration.openshift.io/v1  
+kind: MachineConfig  
+metadata:  
+&nbsp;&nbsp;labels:  
+&nbsp;&nbsp;&nbsp;&nbsp;machineconfiguration.openshift.io/role: worker  
+&nbsp;&nbsp;name: 99\-worker-multipath-conf  
+spec:  
+&nbsp;&nbsp;config:  
+&nbsp;&nbsp;&nbsp;&nbsp;ignition:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;version: 3.2.0  
+&nbsp;&nbsp;&nbsp;&nbsp;storage:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;files:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- contents:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;source: data:,defaults%20%7B%0A%20%20user\_friendly\_names%20yes%0A%20%20find\_multipaths%20no%0A%7D%0A  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mode: 420  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;path: /etc/multipath.conf
+
+Once host preparation is complete, the TridentBackendConfig abstracts the backend from developers. The storage array leverages NetApp Aggregate Encryption (NAE), fulfilling the data reduction preservation requirement, as encryption occurs post-deduplication and compression at the aggregate level28.
+
+## **Zero-Trust Security and Cryptographic Key Flow**
+
+The zero-trust architecture demands a verifiable chain of trust spanning from the physical hardware up to namespace-level network communication. This requires deep integration between the Thales Luna Network S750 HSM, HashiCorp Vault Enterprise, and OpenShift's native security primitives.
+
+### **Cryptographic Key Lifecycle from Cold Boot**
+
+Tracing the exact key flow from a cold boot ensures no secrets exist in plaintext on persistent media, mitigating physical theft or unauthorized cloning risks.
+
+> 1. **Hardware Root of Trust**: The HPE DL380 Gen12 initiates the boot process via UEFI Secure Boot. The Silicon Root of Trust verifies the cryptographic signatures of the firmware before handing execution over to the bootloader2.  
+> 2. **OS Decryption**: The RHCOS 9.x bootloader executes. The underlying disk partitions are encrypted via LUKS2. In this architecture, the decryption keys are retrieved dynamically via Network-Bound Disk Encryption (NBDE) using a Tang server, ensuring the node only decrypts if it is physically attached to the trusted corporate network12.  
+> 3. **HSM Initialization**: The Thales Luna Network S750 HSM powers on, holding the master cryptographic materials within its FIPS 140-2 Level 3 / FIPS 140-3 tamper-responsive physical boundary31.  
+> 4. **HashiCorp Vault Auto-Unseal**: Vault Enterprise pods boot within the OpenShift cluster. Vault is configured with a PKCS\#11 seal stanza pointing to the Luna HSM client library.  
+>    The vault.hcl configuration is injected via a Kubernetes Secret:  
+>    Terraform  
+>    seal "pkcs11" {  
+>    &nbsp;&nbsp;lib            \= "/usr/safenet/lunaclient/lib/libCryptoki2\_64.so"  
+>    &nbsp;&nbsp;slot           \= "0"  
+>    &nbsp;&nbsp;pin            \= "AAAA-BBBB-CCCC-DDDD"  
+>    &nbsp;&nbsp;key\_label      \= "vault-hsm-key"  
+>    &nbsp;&nbsp;hmac\_key\_label \= "vault-hsm-hmac-key"  
+>    &nbsp;&nbsp;mechanism      \= "0x0009"  
+>    &nbsp;&nbsp;generate\_key   \= "true"  
+>    }
+
+>    Vault connects to the HSM, authenticates via the slot PIN, and requests the HSM to decrypt its Master Key using the RSA\_PKCS\_OAEP mechanism (0x0009). Once the Master Key is decrypted in Vault's ephemeral memory, the Vault service unseals and begins accepting client requests32.  
+> 5. **OpenShift etcd Encryption (KMS v2)**: OpenShift's kube-apiserver is configured to use the Kubernetes KMS v2 provider to encrypt etcd34. An EncryptionConfiguration is passed to the API server, instructing it to call out to the Vault KMS Provider sidecar. Vault provisions the Data Encryption Keys (DEKs). All OpenShift Secrets, ConfigMaps, and OAuth tokens are encrypted by Vault before being flushed to the etcd disk34.  
+> 6. **Service Mesh mTLS Certificate Issuance**: Istio (istiod) requires an Intermediate Certificate Authority (CA) to mint workload certificates via the Secret Discovery Service (SDS)37. Vault acts as the Root PKI. An external secrets operator fetches the Intermediate CA from Vault and mounts it into the istio-system namespace. istiod subsequently provisions short-lived X.509 certificates (often with a TTL of 12 to 24 hours) to the Envoy sidecar proxies running alongside the database pods37.  
+> 7. **Storage Array Decryption**: Simultaneously, the NetApp AFF A900 array connects directly to the Luna HSM via the Key Management Interoperability Protocol (KMIP). The array retrieves its aggregate encryption keys (NAE), decrypting the physical flash media at the controller level before exposing block devices to the Trident CSI28.
+
+### **Step-by-Step Verification: Multi-Tenant Persistent Volume Isolation**
+
+A core requirement of this multi-tenant AI platform is proving that Team A cannot read Team B's volume data, even if Team B's Persistent Volume (PV) is mounted to an OpenShift node where Team A has executing pods. This defense-in-depth relies heavily on SELinux Multi-Category Security (MCS)39.
+
+Unlike standard Discretionary Access Control (DAC) reliant on UNIX UIDs/GIDs, SELinux Mandatory Access Control (MAC) enforces isolation at the kernel level. When a pod is scheduled, OpenShift's container runtime (CRI-O) automatically allocates a unique, pseudo-random MCS label to the pod (e.g., s0:c123,c456)39. The kubelet ensures that the underlying Trident-mounted block device is recursively relabeled to match this exact MCS category.
+
+To verify this zero-trust posture step-by-step:
+
+> 1. **Identify the Target Pods**: Determine the node where both Team A and Team B have running pods.  
+>    Bash  
+>    oc get pods \-n team-a \-o wide  
+>    oc get pods \-n team-b \-o wide
+
+> 2. **Inspect the SELinux Process Contexts**: Gain a debug shell on the underlying worker node and list the process security contexts of the CRI-O container processes.  
+>    Bash  
+>    oc debug node/\<worker-node-name\>  
+>    chroot /host  
+>    ps \-eZ | grep "team-a-pod"  
+>    ps \-eZ | grep "team-b-pod"
+
+>    *Expected Output*: The Team A process will run as system\_u:system\_r:container\_t:s0:c10,c25, while Team B runs as system\_u:system\_r:container\_t:s0:c89,c14239.  
+> 3. **Inspect the Persistent Volume Contexts**: Locate the mount paths for the CSI volumes in /var/lib/kubelet/pods/ and verify the file contexts.  
+>    Bash  
+>    ls \-lZ /var/lib/kubelet/pods/\<team-a-pod-uuid\>/volumes/kubernetes.io\~csi/  
+>    ls \-lZ /var/lib/kubelet/pods/\<team-b-pod-uuid\>/volumes/kubernetes.io\~csi/
+
+>    *Expected Output*: The Team B volume will be labeled system\_u:object\_r:container\_file\_t:s0:c89,c142.  
+> 4. **Attempt Unauthorized Access**: Even if a user in Team A escapes their container boundary and achieves local user execution on the node, any attempt to execute cat on Team B's mount path will be intercepted by the Linux kernel. The kernel compares c10,c25 against c89,c142. Because the categories do not strictly match, SELinux immediately throws an EACCES (Permission Denied) error and logs an AVC denial to the audit subsystem39.
+
+At the network layer, OVN-Kubernetes NetworkPolicy objects default to DenyAll, dropping all layer 3 traffic between the team-a and team-b namespaces41. At Layer 7, Istio AuthorizationPolicies strictly enforce that only identities possessing an X.509 certificate minted for the team-b service account can establish an mTLS session with the database8.
+
+## **Performance and Resource Sizing Sanity Check**
+
+Deploying 144-core, 4TB RAM worker nodes populated with 3x NVIDIA L4 GPUs creates an exceptionally dense computing environment1. Validating the CPU and memory overhead of the zero-trust control plane against the PCIe bus mechanics of AI workloads is critical to preventing silent bottlenecks.
+
+### **Control Agent and Proxy CPU Overhead**
+
+Zero-trust architecture mandates ubiquitous telemetry, encryption, and introspection. On a 144-core system, the foundational DaemonSets must be accurately sized and sequestered from the database workloads.
+
+&nbsp;
+
+| Agent / Component | Mechanism | Estimated Overhead (144-Core Node) |
+| :---- | :---- | :---- |
+| **Istio Envoy Proxy** | Sidecar interception via iptables. Handles L7 telemetry, routing, and mTLS cryptography per pod37. | \~0.5 to 1.5 cores per proxy under heavy database transaction loads. Memory: \~100MB per proxy. |
+| **OVN-Kubernetes IPsec** | Node-to-node encryption via Geneve encapsulation and IPsec ESP41. | 4 to 8 dedicated cores. Highly dependent on network throughput unless hardware offloading (e.g., NVIDIA BlueField) is utilized43. |
+| **RHACS eBPF Collector** | Traces kernel-level system calls (execve, sockets) via eBPF probes13. | 1 to 3 cores. Processing thousands of context switches across 144 cores generates measurable CPU interrupts. |
+| **Astra Trident CSI** | Manages ontap-san NVMe/TCP paths and block attachments5. | \< 0.5 cores. Minimal overhead post-attachment. |
+
+**MTU Fragmentation Considerations:** OVN-Kubernetes introduces 100 bytes of overhead for standard Geneve encapsulation (compared to 50 bytes for the legacy OpenShift SDN)45. When IPsec is enabled (ovnKubernetesConfig: ipsecConfig: {}), the Encapsulating Security Payload (ESP) headers add further packet overhead10. If the physical network switch is strictly locked to an MTU of 1500, the effective pod-to-pod MTU will shrink below 1350 bytes. When CNPG pods stream massive multi-megabyte vector payloads across nodes, this reduced MTU will force packet fragmentation, drastically increasing CPU interrupt load and latency42. Jumbo frames (MTU 9000\) must be enabled at the physical switch and host OS level to mitigate this.
+
+Despite these heavy architectural taxes, allocating 16 to 24 cores to the OpenShift control plane and security agents still leaves approximately 120 physical cores entirely dedicated to the 18 PostgreSQL workloads, providing massive compute headroom.
+
+### **PCIe Gen5 Bus Bottlenecks and Vector Embeddings**
+
+The architectural design places 18 concurrent CloudNativePG (PostgresML \+ pgvector) pods on a single node, sharing 3x NVIDIA L4 GPUs.
+
+The HPE DL380 Gen12 supports PCIe Gen5 (128 GB/s bidirectional), but the NVIDIA L4 is constrained to PCIe Gen4 x16 (64 GB/s bidirectional)1. During high-load retrieval-augmented generation (RAG) tasks, 18 pods will simultaneously stream vector embeddings to the GPUs. If 6 pods attempt to stream thousands of 1536-dimensional vectors into a single L4 GPU's VRAM, the data must serialize over the PCIe bus46. The data path travels from the container's RAM, through the kernel via copy\_from\_user, across the physical PCIe root complex, and into the L4's GDDR6 VRAM. While 64 GB/s is vast, the concurrent demands of 6 disparate database pods issuing asynchronous cudaMemcpy operations across the same bus will induce microscopic queuing delays. Strict adherence to the single-numa-node policy prevents these memory copies from traversing the sluggish UPI inter-socket link16.
+
+### **pgvector HNSW Memory Footprint**
+
+CloudNativePG utilizing pgvector with Hierarchical Navigable Small World (HNSW) indexes carries a severe memory footprint. The memory required for an HNSW index is governed by the vector dimensionality (![][image1]) and the number of bidirectional links/edges per node (![][image2])48.
+
+The raw bytes required per vector can be modeled as:
+
+![][image3]
+
+For a standard OpenAI text-embedding-3-small output of 1536 dimensions, and a default ![][image4]: ![][image5]46.
+
+Indexing 5 million vectors requires approximately 31 GB of RAM purely for the index graph49. For 18 distinct tenant databases, the active working set of HNSW indexes will consume nearly 600 GB of RAM. The 4TB DDR5 memory specification of the HPE Gen12 is more than adequate to keep these indexes fully cached in RAM, preventing severe disk I/O thrashing1. However, the Postgres maintenance\_work\_mem parameter must be explicitly tuned to 2GB or higher to prevent out-of-memory kernel panics during concurrent index construction46.
+
+### **GPU Time-Slicing Context Switch Latency**
+
+Because the L4 lacks MIG hardware partitioning, the 6 pods sharing a single L4 rely on software-based CUDA time-slicing3. The GPU scheduler interleaves execution, switching contexts between the database pods every few milliseconds20.
+
+While time-slicing maintains high aggregate throughput, the latency penalty of context switching heavily impacts the 99th percentile (p99) response time52. If Pod 1 requires 2ms to perform a cosine distance calculation, but the GPU is currently processing a heavy payload for Pod 2, Pod 1 must wait in the execution queue52. For latency-sensitive, real-time RAG applications, this jitter is unavoidable without stepping up to a MIG-capable GPU (such as the H100) or dedicating whole GPUs via PCIe passthrough20. The architecture accepts this trade-off in favor of maximum multi-tenant density.
+
+## **Step-by-Step Implementation Roadmap**
+
+A zero-trust platform requires strict sequencing; security mechanisms must be established before workloads are admitted. The following four-phase execution roadmap outlines the logical deployment order and highlights critical paths.
+
+### **Phase 1: Physical Hardware & Cryptographic Root**
+
+The initial phase establishes the immutable cryptographic foundation.
+
+> 1. **Hardware Commissioning**: Rack and cable the HPE DL380 Gen12 nodes and the NetApp AFF A900 arrays.  
+> 2. **UEFI & Secure Boot**: Access the HPE iLO 6 interface. Enable UEFI Secure Boot, TPM 2.0, and SR-IOV/VT-d capabilities in the BIOS to prepare for PCIe device mapping2.  
+> 3. **HSM Initialization**: Power on the Thales Luna Network S750 HSM. Generate the PKCS\#11 partitions, assign security officer roles, and establish the KMIP network endpoints31.  
+> 4. **Storage Array Bootstrapping**: Initialize the NetApp ONTAP cluster. Bind the array to the Luna HSM via KMIP for NetApp Aggregate Encryption (NAE)28. Create the dedicated Storage Virtual Machines (SVMs) for OpenShift block traffic.
+
+### **Phase 2: OpenShift Platform Foundation**
+
+The OpenShift platform is bootstrapped atop the secure hardware, representing a critical **point of no return** for FIPS enablement.
+
+> 1. **Install OpenShift in FIPS Mode**: Generate the install-config.yaml. Explicitly declare fips: true10. FIPS mode cannot be enabled post-installation without entirely wiping and rebuilding the cluster.  
+> 2. **Network Provider Configuration**: Within install-config.yaml, declare networkType: OVNKubernetes. Generate the manifests and inject the IPsec ESP configuration (ovnKubernetesConfig: ipsecConfig: {}) to activate node-to-node encryption10. Execute the cluster installation.  
+> 3. **NUMA and Host Tuning (Critical Path)**: Deploy the Machine Config Operator (MCO) profiles. Apply the KubeletConfig for topologyManagerPolicy: single-numa-node to the worker nodes19. Concurrently, apply the MachineConfig to configure /etc/multipath.conf with find\_multipaths no27. Allow the cluster to roll out the reboots.  
+> 4. **Storage Orchestration**: Install the NetApp Astra Trident Operator27. Deploy the TridentBackendConfig pointing to the ONTAP SAN SVM utilizing NVMe/TCP or iSCSI, and establish the default StorageClass55.
+
+### **Phase 3: Zero-Trust Security & Identity Integration**
+
+This phase weaves the identity, secrets management, and telemetry systems into the platform.
+
+> 1. **HashiCorp Vault Deployment**: Deploy HashiCorp Vault Enterprise. Apply the vault.hcl configuration containing the seal "pkcs11" parameters to connect to the Luna HSM for auto-unseal32.  
+> 2. **etcd KMS v2 Configuration**: Configure the OpenShift API server to utilize the external Vault KMS v2 provider. This rotates the etcd encryption keys and encrypts all cluster secrets at rest34.  
+> 3. **Active Directory & RBAC**: Configure the OpenShift OAuth server to synchronize with the enterprise Active Directory via LDAP. Establish the ClusterRoleBindings to map LDAP groups to strict, namespace-bound permissions.  
+> 4. **RHACS Integration**: Deploy Red Hat Advanced Cluster Security. Ensure the collector pods successfully compile and inject eBPF probes into the RHCOS kernels to begin active vulnerability monitoring13.
+
+### **Phase 4: AI Workload & Multi-Tenancy Enablement**
+
+The final phase introduces the AI acceleration capabilities, database layers, and service mesh routing.
+
+> 1. **NVIDIA GPU Operator**: Install the NVIDIA GPU Operator. Apply the time-slicing-config ConfigMap to partition the nvidia.com/gpu resource17. Verify that the kubelet advertises 18 GPUs per node.  
+> 2. **OpenShift Service Mesh**: Deploy the OpenShift Service Mesh (Istio) Operator. Configure the control plane to interface with Vault to generate the Intermediate CA for mTLS37. Enforce a default PeerAuthentication policy of STRICT to mandate mTLS across all application namespaces.  
+> 3. **CloudNativePG Rollout**: Install the CloudNativePG Operator6. Tenant namespaces are provisioned with strict ResourceQuotas and LimitRanges. Within these isolated namespaces, developers deploy PostgresML clusters requesting nvidia.com/gpu: 1, backed dynamically by Trident persistent volumes.  
+> 4. **OAuth Proxy Injection**: Deploy the OpenShift OAuth Proxy as a sidecar container to front-end any database management UI endpoints, enforcing AD-based HTTP access control before traffic reaches the application25.
+
+## **Conclusion**
+
+The proposed architecture establishes an exceptionally robust, highly secure paradigm for enterprise AI. By adhering to the "Red Hat way," combining OpenShift's native constructs with hardware-anchored cryptography from Thales and HashiCorp, the platform strictly enforces zero-trust multi-tenancy. The combination of SELinux MCS labels, OVN-Kubernetes isolation, and strict Istio mTLS ensures that data remains impermeable across tenant boundaries.
+
+While the HPE DL380 Gen12 with dual Intel Xeon 6 processors and 4TB of memory provides massive compute overhead to sustain pgvector HNSW indexes and IPsec network encryption, engineering teams must maintain vigilant monitoring of the NVIDIA L4 GPU time-slicing configuration. Because the L4 lacks hardware-level MIG partitioning, the context-switch latency of temporal oversubscription will introduce unavoidable jitter into vector search query times. Meticulous application of the single-numa-node topology manager policy to prevent cross-socket PCIe latency, combined with properly tuned block storage multipathing via NetApp Trident, will remain the critical operational imperatives for maximizing system throughput and preserving service level agreements.
+
+#### **Works cited**
+
+> 1. HPE DL380a Gen12 Specs & Price | 10 GPUs, Xeon 6 | ITCT MENA, [https://itctshop.com/product/hpe-dl380a-gen12/](https://itctshop.com/product/hpe-dl380a-gen12/)  
+> 2. HPE ProLiant DL360 Gen12 — 1U Dense Rack Server \- Sora Yazılım, [https://sorayazilim.com/en/cozumlerimiz/hp-sunucular/proliant-dl360-gen12](https://sorayazilim.com/en/cozumlerimiz/hp-sunucular/proliant-dl360-gen12)  
+> 3. NVIDIA L4 \+ VMware for AI Inference (2026 Update), [https://iotdigitaltwinplm.com/nvidia-l4-and-vmware-for-ai-inference/](https://iotdigitaltwinplm.com/nvidia-l4-and-vmware-for-ai-inference/)  
+> 4. Configure the Storage Backend \- Trident \- NetApp Docs, [https://docs.netapp.com/us-en/trident/trident-use/trident-fsx-storage-backend.html](https://docs.netapp.com/us-en/trident/trident-use/trident-fsx-storage-backend.html)  
+> 5. NetApp Trident Basics | simplyblock, [https://simplyblock.io/glossary/netapp-trident/](https://simplyblock.io/glossary/netapp-trident/)  
+> 6. buun-stack \- GitHub, [https://github.com/buun-ch/buun-stack](https://github.com/buun-ch/buun-stack)  
+> 7. Red Hat Advanced Cluster Security For Kubernetes | PDF \- Scribd, [https://www.scribd.com/document/541163013/ma-stackrox-datasheet-f27185wg-202102-en-1](https://www.scribd.com/document/541163013/ma-stackrox-datasheet-f27185wg-202102-en-1)  
+> 8. OpenShift Service Mesh | Specs, reviews and EoL info \- InvGate, [https://invgate.com/itdb/openshift-service-mesh](https://invgate.com/itdb/openshift-service-mesh)  
+> 9. FIPS 140-2 / FIPS 140-3 \- Le Site de François, [https://lesitedefrancois.be/en/compliance/fips-140/](https://lesitedefrancois.be/en/compliance/fips-140/)  
+> 10. Configuring FIPS support on OpenShift \- IBM, [https://www.ibm.com/docs/en/api-connect/software/10.0.8\_lts?topic=integration-configuring-fips-support-openshift](https://www.ibm.com/docs/en/api-connect/software/10.0.8_lts?topic=integration-configuring-fips-support-openshift)  
+> 11. Guide to the Secure Configuration of Red Hat OpenShift Container, [https://static.open-scap.org/ssg-guides/ssg-ocp4-guide-moderate.html](https://static.open-scap.org/ssg-guides/ssg-ocp4-guide-moderate.html)  
+> 12. Chapter 3\. Switching RHEL to FIPS mode | Security hardening | 9, [https://docs.redhat.com/en/documentation/red\_hat\_enterprise\_linux/9/html/security\_hardening/switching-rhel-to-fips-mode\_security-hardening](https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/9/html/security_hardening/switching-rhel-to-fips-mode_security-hardening)  
+> 13. eBPF wrapped 2023 \- Red Hat, [https://www.redhat.com/en/blog/ebpf-wrapped-2023](https://www.redhat.com/en/blog/ebpf-wrapped-2023)  
+> 14. Chapter 3\. Installing RHACS on Red Hat OpenShift, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/3.74/html/installing/installing-rhacs-on-red-hat-openshift](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/3.74/html/installing/installing-rhacs-on-red-hat-openshift)  
+> 15. Red Hat ACS, Wiz, SentinelOne, and Tenable \- ResearchGate, [https://www.researchgate.net/publication/392632685\_Comparative\_Performance\_Evaluation\_of\_Modern\_Container\_Security\_Agents\_Red\_Hat\_ACS\_Wiz\_SentinelOne\_and\_Tenable](https://www.researchgate.net/publication/392632685_Comparative_Performance_Evaluation_of_Modern_Container_Security_Agents_Red_Hat_ACS_Wiz_SentinelOne_and_Tenable)  
+> 16. Kubernetes Topology Manager for GPU and NUMA Alignment, [https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/](https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/)  
+> 17. NVIDIA GPUs \- AI on OpenShift, [https://ai-on-openshift.io/odh-rhoai/nvidia-gpus/](https://ai-on-openshift.io/odh-rhoai/nvidia-gpus/)  
+> 18. borball/k8s-tm-test: K8s Topology Manager \- GitHub, [https://github.com/borball/k8s-tm-test](https://github.com/borball/k8s-tm-test)  
+> 19. Chapter 7\. Using Topology Manager | OpenShift Container Platform, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.3/html/scalability\_and\_performance/using-topology-manager](https://docs.redhat.com/en/documentation/openshift_container_platform/4.3/html/scalability_and_performance/using-topology-manager)  
+> 20. Run Multiple LLMs on One GPU: MIG, Time-Slicing, and MPS Guide, [https://www.spheron.network/blog/run-multiple-llms-one-gpu-mig-time-slicing-guide/](https://www.spheron.network/blog/run-multiple-llms-one-gpu-mig-time-slicing-guide/)  
+> 21. NVIDIA Kubernetes Device Plug-in \- Boyang Yan, [https://yanboyang.com/posts/20230813061918-nvidia\_kubernetes\_device\_plug\_in](https://yanboyang.com/posts/20230813061918-nvidia_kubernetes_device_plug_in)  
+> 22. MIG vs MPS vs Time-Slicing: Four Ways to Share a GPU ... \- Preporato, [https://preporato.com/blog/gpu-sharing-mig-vs-mps-vs-time-slicing](https://preporato.com/blog/gpu-sharing-mig-vs-mps-vs-time-slicing)  
+> 23. Time-Slicing GPUs in Kubernetes — NVIDIA GPU Operator, [https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html)  
+> 24. Microsoft Azure Local \- NVIDIA Docs, [https://docs.nvidia.com/vgpu/16.0/grid-vgpu-release-notes-microsoft-azure-stack-hci/index.html](https://docs.nvidia.com/vgpu/16.0/grid-vgpu-release-notes-microsoft-azure-stack-hci/index.html)  
+> 25. Latest HPE Servers Online With Preferred Configuration At Best Price, [https://www.serverbasket.net/c/hp-servers/](https://www.serverbasket.net/c/hp-servers/)  
+> 26. ONTAP SAN configuration options and examples \- NetApp Docs, [https://docs.netapp.com/us-en/trident-2502/trident-use/ontap-san-examples.html](https://docs.netapp.com/us-en/trident-2502/trident-use/ontap-san-examples.html)  
+> 27. trident/trident-install/kubernetes-deploy-tridentctl.adoc at main \- GitHub, [https://github.com/NetAppDocs/trident/blob/main/trident-install/kubernetes-deploy-tridentctl.adoc](https://github.com/NetAppDocs/trident/blob/main/trident-install/kubernetes-deploy-tridentctl.adoc)  
+> 28. FlexPod NetApp ONTAP storage and FIPS 140-2, [https://docs.netapp.com/us-en/flexpod/security/flexpod-fips-flexpod-netapp-ontap-storage-and-fips-140-2.html](https://docs.netapp.com/us-en/flexpod/security/flexpod-fips-flexpod-netapp-ontap-storage-and-fips-140-2.html)  
+> 29. Why do you like WAFLs? – Page 3 \- NetApp, ONTAP, [https://whydoyoulikewafls.wordpress.com/page/3/](https://whydoyoulikewafls.wordpress.com/page/3/)  
+> 30. Security and compliance | OpenShift Container Platform | 4.16, [https://docs.redhat.com/documentation/openshift\_container\_platform/4.16/pdf/security\_and\_compliance/](https://docs.redhat.com/documentation/openshift_container_platform/4.16/pdf/security_and_compliance/)  
+> 31. HashiCorp Vault with Thales Luna HSMs \- Integration Guide, [https://cpl.thalesgroup.com/resources/encryption/hashicorp-vault-luna-hsm-integration-guide](https://cpl.thalesgroup.com/resources/encryption/hashicorp-vault-luna-hsm-integration-guide)  
+> 32. HSM PKCS11 seal configuration | Vault \- HashiCorp Developer, [https://developer.hashicorp.com/vault/docs/configuration/seal/pkcs11](https://developer.hashicorp.com/vault/docs/configuration/seal/pkcs11)  
+> 33. HashiCorp Vault \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp\_vault/index.html](https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp_vault/index.html)  
+> 34. Kubernetes Secrets Encryption \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/kubernetes\_secrets\_encryption/](https://www.thalesdocs.com/gphsm/integrations/guides/kubernetes_secrets_encryption/)  
+> 35. Azure Key Vault KMS plugin for Kubernetes \- GitHub, [https://github.com/openshift/azure-kubernetes-kms](https://github.com/openshift/azure-kubernetes-kms)  
+> 36. 1.2.34 Ensure that encryption providers are appropriately configured, [https://www.tenable.com/audits/items/CIS\_RedHat\_OpenShift\_Container\_Platform\_4\_v1.2.0\_L1.audit:a7804444c32b403962188424e9c6bfd6](https://www.tenable.com/audits/items/CIS_RedHat_OpenShift_Container_Platform_4_v1.2.0_L1.audit:a7804444c32b403962188424e9c6bfd6)  
+> 37. Kubernetes TLS Termination & Managing Certificates, [https://devsecopsguru.in/kb/kubernetes-tls-termination-managing-certificates/](https://devsecopsguru.in/kb/kubernetes-tls-termination-managing-certificates/)  
+> 38. How to Handle Secret Management in Istio \- OneUptime, [https://oneuptime.com/blog/post/2026-02-24-how-to-handle-secret-management-in-istio/view](https://oneuptime.com/blog/post/2026-02-24-how-to-handle-secret-management-in-istio/view)  
+> 39. How to Enforce SELinux Labels on Kubernetes Pods and Volumes, [https://oneuptime.com/blog/post/2026-02-09-selinux-labels-kubernetes-pods-volumes/view](https://oneuptime.com/blog/post/2026-02-09-selinux-labels-kubernetes-pods-volumes/view)  
+> 40. concept MCS level in category openshift \- liveBook · Manning, [https://livebook.manning.com/concept/openshift/mcs-level](https://livebook.manning.com/concept/openshift/mcs-level)  
+> 41. Chapter 15\. OVN-Kubernetes default CNI network provider, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.7/html/networking/ovn-kubernetes-default-cni-network-provider](https://docs.redhat.com/en/documentation/openshift_container_platform/4.7/html/networking/ovn-kubernetes-default-cni-network-provider)  
+> 42. Optimizing networking | Scalability and performance | OKD 4.14, [https://docs.okd.io/4.14/scalability\_and\_performance/optimization/optimizing-networking.html](https://docs.okd.io/4.14/scalability_and_performance/optimization/optimizing-networking.html)  
+> 43. Openshift Container Platform 4.13 Release Notes en Us | PDF \- Scribd, [https://www.scribd.com/document/669389863/Openshift-Container-Platform-4-13-Release-Notes-en-Us](https://www.scribd.com/document/669389863/Openshift-Container-Platform-4-13-Release-Notes-en-Us)  
+> 44. OVN Offload TNG starring OpenShift and BlueField-2 \- Open vSwitch, [https://www.openvswitch.org/support/ovscon2021/slides/openshift\_and\_bluefield-2.pdf](https://www.openvswitch.org/support/ovscon2021/slides/openshift_and_bluefield-2.pdf)  
+> 45. Migrating from the OpenShift SDN network plugin \- OVN-Kubernetes, [https://docs.okd.io/4.16/networking/ovn\_kubernetes\_network\_provider/migrate-from-openshift-sdn.html](https://docs.okd.io/4.16/networking/ovn_kubernetes_network_provider/migrate-from-openshift-sdn.html)  
+> 46. Pgvector Similarity Search in Production Postgres \- Tech Verse Daily, [https://techversedaily.com/post/pgvector-similarity-search-in-production-postgres](https://techversedaily.com/post/pgvector-similarity-search-in-production-postgres)  
+> 47. Vector Databases Compared: pgvector vs Pinecone vs Weaviate, [https://backendbytes.com/articles/vector-databases-comparison/](https://backendbytes.com/articles/vector-databases-comparison/)  
+> 48. postgresql \- How to calculate amount of RAM required for serving X, [https://stackoverflow.com/questions/77401874/how-to-calculate-amount-of-ram-required-for-serving-x-n-dimensional-vectors-with](https://stackoverflow.com/questions/77401874/how-to-calculate-amount-of-ram-required-for-serving-x-n-dimensional-vectors-with)  
+> 49. Load vector embeddings up to 67x faster with pgvector and Amazon, [https://aws.amazon.com/blogs/database/load-vector-embeddings-up-to-67x-faster-with-pgvector-and-amazon-aurora/](https://aws.amazon.com/blogs/database/load-vector-embeddings-up-to-67x-faster-with-pgvector-and-amazon-aurora/)  
+> 50. How to scale vector search in Postgres (pgvector) for RAG and AI, [https://clickhouse.com/resources/engineering/scale-vector-search-postgres](https://clickhouse.com/resources/engineering/scale-vector-search-postgres)  
+> 51. Demystifying NVIDIA MPS: How Multi‑Process Service Improves, [https://sagar-parmar.medium.com/demystifying-nvidia-mps-how-multi-process-service-improves-gpu-sharing-and-performance-9f633878318a](https://sagar-parmar.medium.com/demystifying-nvidia-mps-how-multi-process-service-improves-gpu-sharing-and-performance-9f633878318a)  
+> 52. GPU Time-Slicing for Concurrent LLM Agents on Kubernetes, [https://towardsdatascience.com/gpu-time-slicing-for-concurrent-llm-agents-on-kubernetes/](https://towardsdatascience.com/gpu-time-slicing-for-concurrent-llm-agents-on-kubernetes/)  
+> 53. Maximize AI Infrastructure Throughput by Consolidating, [https://developer.nvidia.com/blog/maximize-ai-infrastructure-throughput-by-consolidating-underutilized-gpu-workloads/](https://developer.nvidia.com/blog/maximize-ai-infrastructure-throughput-by-consolidating-underutilized-gpu-workloads/)  
+> 54. Installing and Configuring NVIDIA Virtual GPU Manager, [https://docs.nvidia.com/vgpu/latest/grid-vgpu-user-guide/installing-configuring-grid-vgpu.html](https://docs.nvidia.com/vgpu/latest/grid-vgpu-user-guide/installing-configuring-grid-vgpu.html)  
+> 55. Deploying NetApp Trident for SAP Edge Integration Cell on, [https://access.redhat.com/articles/7091879](https://access.redhat.com/articles/7091879)  
+> 56. Using NetApp Storage on Harvester, [https://harvesterhci.io/kb/install\_netapp\_trident\_csi/](https://harvesterhci.io/kb/install_netapp_trident_csi/)  
+> 57. How to Encrypt Secrets at Rest with KMS | K8s Recipes, [https://kubernetes.recipes/recipes/security/secrets-encryption-kms/](https://kubernetes.recipes/recipes/security/secrets-encryption-kms/)  
+> 58. Chapter 4\. Installing RHACS on Red Hat OpenShift, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/4.9/html/installing/installing-rhacs-on-red-hat-openshift](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/4.9/html/installing/installing-rhacs-on-red-hat-openshift)  
+> 59. Deploy a PostgreSQL vector database on GKE | Kubernetes Engine, [https://docs.cloud.google.com/kubernetes-engine/docs/tutorials/deploy-pgvector](https://docs.cloud.google.com/kubernetes-engine/docs/tutorials/deploy-pgvector)
+
+[image1]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAsAAAAZCAYAAADnstS2AAAAqUlEQVR4XmNgGDJAAohl0AXRwUIg/g/FRWhyWIEmA0QxC7oENrCSAaKYKABS+BVdEBn0AHETlA1SXIMkBweVQPwLylZlQHiOHa4CClKhEhxIYpegYhgAJPgci9h3NDEGD6hEOpo4SKwBTYxhMwOmdSlIYpZAzAWTSEOSgAGQR2FiH5ElQOA3EBcyQEz5wwAJGZBiZSBehKQODtQYIO6HASEgdkTijwI6AQCURSXAcD7IXAAAAABJRU5ErkJggg==>
+
+[image2]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABYAAAAaCAYAAACzdqxAAAABC0lEQVR4XmNgGAX0BvVA/AWI/0PxWVRpDPCQAaEWpK8YVRoTwBSDMC6gB8S1DBA1xmhyOMETBoTLcYHHQHyMAb8aFOAFxClAvIUBt6Z1UJqQr1DACSgNCi9smniAOBfKBsmvRpLDC2CGgcINxJZBkgOBH1DanQEir4Ukhxc8RWKDNMYh8fOBmBvKBvkMm4+wApAr0pD4II0LkfjI3iYrfGEApBEU+yDwDFmCASK3Ck0MJ0B3AcxVtkCsgyTuDRXXRhLDC16i8d8wQAy4jSYOypHojsAKGIH4LgMkiyKD5QzYDSAqfHuA+AMQvwXiz0D8B0nOB4hDkfhfGRBqPwHxbyCuRJIfBaNgFBADAG1ESZl9s8ZBAAAAAElFTkSuQmCC>
+
+[image3]: <data:image/png;base64,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>
+
+[image4]: <data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEYAAAAaCAYAAAAKYioIAAAB90lEQVR4Xu2Wzys/QRjHH+LESQnlrpADro76Fm5ydZITKXJwwF0O7uQbDopyUm6OovgLJORHfpb8KKF43s1M++zszu5+Dj77SfOqd7PzvGdmZ5+dnVkij8fjKR6zrFfWt9ZR2I5wTkFb9JsI20Xn0A5YlJN6Jsz3glURttMxDwu5aGNNk2rTYXnF5ICyzbedlF+n6/26XhCXFKwcF8j4HiW3KSbj5J5LGSmvU8TSEhmhhzXE2iZ3xy1dFjz4L5KUmDOKevisKq1YIvu6xH5hDwaqWaP6Gv6m8PIkKTHyBTaz6oWXGTMA9g1cNwoPvOvyHykfNyoF0hKDg+KOVcMa0bEq2SiNK3GNzoOiPkbBYFhZrom4WHNolbXC+s9aZi2xFnWfrLgS00DhFWM4jYk5wSoYFnV0xIQN8rOJu1meuBKDFxk31xkda7LisZj9xYCOOH3AtTRIeRtWLE9ciQHyOQym/aQVj8Ue2GS6i9Uq4r063iJiWZgrUIWQlphbK4aEIC6/ECd25wdSnY+tuPl7LCWSEoPVbnsLOoZ/HCcwT0jt3JJ1ig4IzEoqJbDCMKda26Bgn8GJZEB9V9QjzLOeWI+sF9aX8PpYA6L+RkHbZ9Yna0r4efDBuiH1t459BOU9qdNO0k0qGTh1Ue6EbY/H4/F4PB7Pn+YHJPmbMBv41soAAAAASUVORK5CYII=>
+
+[image5]: <data:image/png;base64,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>
