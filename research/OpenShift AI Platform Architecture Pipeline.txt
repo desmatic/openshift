@@ -1,0 +1,363 @@
+# **Target Architecture and Cryptographic Key Flow for Secure Multi-Tenant OpenShift Environments**
+
+## **Architectural Context and Design Tenets**
+
+The modern containerized enterprise requires an architecture where zero-trust principles are woven deeply into the infrastructure, independent of application-layer configuration. This document defines a highly secure, multi-tenant Red Hat OpenShift target architecture built upon a foundation of hardware roots of trust, strict cryptographic key flows, and ephemeral deployment pipelines. The primary design objective guarantees absolute isolation between tenant namespaces—specifically designated as Team A and Team B—ensuring neither team can intercept, modify, or access the other's resources. This isolation is mathematically enforced at the cryptographic layer and cryptographically verified at the admission controller layer.
+
+In this paradigm, security acts as an enabler of developer velocity rather than a hindrance. The platform treats "secure by design" as the abstraction of key management and cryptographic complexity away from the developer. End-users interact exclusively with standard Kubernetes Application Programming Interfaces (APIs), commit code, define standard manifests, and consume storage via PersistentVolumeClaims (PVCs). They are explicitly restricted from handling cryptographic keys, managing storage array configurations, or directly interacting with HashiCorp Vault.
+
+The architecture strictly adheres to a "Red Hat native" philosophy. Wherever a Red Hat-native or Red Hat-certified component exists, it is prioritized over community or third-party equivalents to ensure a unified support lifecycle, deep integration with Red Hat Advanced Cluster Security (RHACS), and native compatibility with OpenShift Pipelines.
+
+## **Compute, Acceleration, and Topology Tuning**
+
+The physical compute layer forms the bedrock of the cluster's performance and security boundary. The specification utilizes HPE ProLiant DL380 Gen12 hardware equipped with Dual Intel Xeon 6 processors, yielding 144 total cores, and 4TB of DDR5 RAM per worker node. This massive compute density requires meticulous orchestration to prevent noisy-neighbor phenomena in a multi-tenant environment.
+
+### **NVIDIA L4 GPU Allocation and Multi-Tenancy**
+
+Each worker node is equipped with three NVIDIA L4 GPUs. Utilizing the Ada Lovelace architecture and featuring 24GB of GDDR6 VRAM, these single-wide GPUs are highly optimized for machine learning inference and database acceleration. Given the multi-tenant requirements and the presence of CloudNativePG (CNPG) utilizing PostgresML and pgvector, the GPUs must be efficiently shared without compromising isolation.
+
+Hardware-level isolation via NVIDIA Multi-Instance GPU (MIG) is widely adopted for stringent multitenancy; however, MIG is physically unsupported on the L4 architecture. Therefore, the architecture relies on temporal isolation via the NVIDIA GPU Operator's time-slicing configuration.
+
+| Feature | NVIDIA MIG (e.g., A100/H100) | NVIDIA Time-Slicing (e.g., L4/T4) |
+| :---- | :---- | :---- |
+| **Hardware Isolation** | Yes (Physical partitioning of CUDA cores and memory) | No (Context switching over shared hardware) |
+| **Fault Isolation** | Yes (ECC errors in one partition do not affect others) | Partial (Shared memory bus can propagate faults) |
+| **Performance Predictability** | High (Guaranteed QoS per partition) | Moderate (Dependent on scheduler and workload bursts) |
+| **L4 Architecture Support** | Unsupported | Fully Supported |
+| **OpenShift Configuration** | MIGManager profiles | ClusterPolicy time-slicing replicas |
+
+Time-slicing allows multiple containers, spanning both Team A and Team B namespaces, to interleave execution on a single L4 GPU. While time-slicing does not provide strict memory isolation at the hardware level, OpenShift's Role-Based Access Control (RBAC), coupled with namespace-scoped ResourceQuotas and LimitRanges, ensures that tenants can only request the logical GPU slices assigned to their namespace.
+
+### **Intel NUMA Architecture Tuning**
+
+To prevent memory bandwidth bottlenecks and ensure deterministic performance for high-throughput database workloads, the OpenShift Kubelet must be configured to respect Non-Uniform Memory Access (NUMA) boundaries. When a pod is scheduled, the CPU cores, RAM, and the PCIe lane pathways to the NVIDIA L4 GPUs must reside on the same physical NUMA node1. If a CPU must cross the QuickPath Interconnect (QPI) or Ultra Path Interconnect (UPI) to access memory or a GPU controlled by the secondary socket, latency spikes and performance degradation occur.
+
+OpenShift manages this via the Topology Manager. By defining a KubeletConfig Custom Resource, the cluster is instructed to enforce a single-numa-node policy1.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: machineconfiguration.openshift.io/v1  
+kind: KubeletConfig  
+metadata:  
+&nbsp;&nbsp;name: strict-numa-alignment  
+spec:  
+&nbsp;&nbsp;machineConfigPoolSelector:  
+&nbsp;&nbsp;&nbsp;&nbsp;matchLabels:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;machineconfiguration.openshift.io/role: worker  
+&nbsp;&nbsp;kubeletConfig:  
+&nbsp;&nbsp;&nbsp;&nbsp;cpuManagerPolicy: static  
+&nbsp;&nbsp;&nbsp;&nbsp;topologyManagerPolicy: single-numa-node  
+&nbsp;&nbsp;&nbsp;&nbsp;reservedSystemCPUs: "0-3,72-75"
+
+Under this policy, if the OpenShift scheduler cannot satisfy the requested CPU, memory, and GPU resources from a single NUMA node, the pod is rejected with a TopologyAffinityError1. This fail-closed approach guarantees that workloads never suffer from cross-NUMA latency penalties, which is critical when streaming vector embeddings from PostgresML directly to the L4 GPUs for inference.
+
+## **Storage and Data Platform Security**
+
+Data persistence and data-at-rest encryption are delegated entirely to the storage fabric to preserve array-side efficiencies and abstract complexity from the application layer. The storage tier utilizes a NetApp AFF A900 array integrated into OpenShift via the NetApp Trident Container Storage Interface (CSI) provisioner.
+
+### **Data Reduction Preservation and TDE Preclusion**
+
+A critical design choice is the preclusion of application-layer Transparent Data Encryption (TDE). Encrypting data at the container or database level obfuscates data blocks, turning highly compressible, repetitive text into high-entropy ciphertext. This renders the NetApp AFF A900's inline storage-level deduplication and compression algorithms entirely ineffective, severely degrading the economic efficiency of the all-flash array.
+
+Instead, encryption is strictly enforced at the storage array layer. When a developer requests a PVC, Trident dynamically provisions a volume on the ONTAP array. Applications rely on standard StorageClass definitions, and end-users are explicitly blocked via network policy and RBAC from accessing NetApp management APIs. The NetApp array relies on external Key Management Interoperability Protocol (KMIP) integration with the hardware root of trust to secure the drives.
+
+### **CloudNativePG and Dynamic Credentials**
+
+The database layer employs the CloudNativePG (CNPG) operator. Team A and Team B maintain independent CNPG instances within their respective namespaces. The CNPG operator is configured to deploy PostgreSQL clusters enriched with the pgvector and PostgresML extensions, accelerating nearest-neighbor searches natively within the database utilizing the time-sliced L4 GPUs.
+
+While data-at-rest encryption is pushed to the storage array, credential management is pulled into HashiCorp Vault. Vault Enterprise manages dynamic database credentials for CNPG. When an application in Team A's namespace requires database access, the Vault Agent sidecar authenticates to Vault via its OpenShift Service Account token. Vault connects to the CNPG instance, generates a highly privileged but ephemeral PostgreSQL role (e.g., valid for 1 hour), and injects these credentials into the application pod. If the application is compromised, the blast radius is temporally limited to the Time-To-Live (TTL) of the dynamic credential.
+
+## **Comprehensive HSM Integration and Cryptographic Foundations**
+
+The foundation of the entire zero-trust architecture relies on externalizing cryptographic material to a FIPS 140-2 Level 3 validated Thales Luna Network S750 Hardware Security Module (HSM). The HSM acts as the ultimate root of trust, and its integration spans six distinct layers of the OpenShift infrastructure.
+
+### **1\. HashiCorp Vault Auto-Unseal**
+
+HashiCorp Vault Enterprise is deployed natively on the OpenShift cluster. By default, Vault initializes in a sealed state and requires a quorum of key shares to unseal. In this architecture, Vault is configured to utilize the Luna S750 HSM for automatic unsealing via the PKCS\#11 provider. The Vault master key is generated and wrapped by the HSM. When the Vault pods are scheduled or restarted, Vault reaches out to the Luna HSM, authenticates via client certificates, and requests the HSM to unwrap the master key, allowing Vault to serve traffic without human intervention.
+
+### **2\. etcd Encryption**
+
+The OpenShift etcd key-value store contains the cluster's most sensitive data, including Secrets, ConfigMaps, and cluster state. To prevent an attacker who gains access to the underlying storage volumes from reading etcd data, etcd encryption is enabled. Rather than using static keys stored on the control plane nodes, OpenShift is configured to use the Vault Transit Secrets Engine as a Key Management Service (KMS) provider via the vault-kubernetes-kms-plugin. When the API server writes a Secret to etcd, it sends the payload to Vault. Vault, backed by the Luna HSM, encrypts the data using a Transit key and returns the ciphertext, which is then persisted in etcd.
+
+### **3\. Certificate Issuance (PKI/CA)**
+
+The cluster's internal Public Key Infrastructure (PKI) relies on Vault's PKI Secrets Engine. The Root Certificate Authority (CA) private key is generated directly within the Luna HSM and cannot be exported. HashiCorp Vault holds an Intermediate CA, signed by the HSM-backed Root CA. All internal certificates required by OpenShift ingress controllers, internal registries, and webhook validation servers are dynamically issued by this Vault Intermediate CA.
+
+### **4\. Service Mesh mTLS (Namespace-to-Namespace)**
+
+OpenShift Service Mesh (Istio) requires certificates for every workload to facilitate mutual TLS (mTLS). Instead of relying on the default Istio self-signed CA, the istio-csr agent is deployed. When Istio components require certificates to establish cryptographic identities (SPIFFE IDs), istio-csr intercepts the Certificate Signing Requests (CSRs) and forwards them to the Vault PKI engine. Consequently, all namespace-to-namespace mTLS traffic is secured by certificates chaining back to the Luna HSM.
+
+### **5\. Node-to-Node Network Encryption**
+
+To secure traffic traversing the physical network switches between the HPE Gen12 worker nodes, OpenShift's OVN-Kubernetes network plugin is configured with IPsec enabled. OVN-Kubernetes utilizes the StrongSwan daemon on each node to negotiate IPsec tunnels. These tunnels require node-level certificates for authentication, which are systematically provisioned via a daemonset interacting with the Vault PKI engine, extending the HSM's trust boundary to the kernel-level network routing layer.
+
+### **6\. Storage Array Encryption at Rest**
+
+As previously established, the NetApp AFF A900 array utilizes NetApp Volume Encryption (NVE). The storage array is configured as a KMIP client communicating directly with the Luna HSM KMIP server. For every dynamically provisioned PVC created by the Trident CSI, ONTAP requests a unique 256-bit AES XTS Data Encryption Key (DEK) from the HSM. The DEK never leaves the HSM in plaintext; it is wrapped by an Authentication Key (AK) before transmission to the array.
+
+## **Zero-Trust Identity, Networking, and Ambient Mesh**
+
+Strict namespace isolation is guaranteed through a default-deny network posture and rigid identity verification using OpenShift Service Mesh (Istio) in Ambient Mode, augmented by Active Directory integration.
+
+### **Istio Ambient Mode and FIPS Considerations**
+
+Traditional Service Mesh deployments rely on sidecar proxies (Envoy) injected into every application pod, which consumes significant compute overhead and complicates operational lifecycles. Istio Ambient Mode shifts this paradigm by decoupling the proxy architecture. It utilizes a per-node ztunnel proxy for Layer 4 traffic (handling mTLS and zero-trust identity) and namespace-scoped waypoint proxies for Layer 7 traffic (handling advanced routing and L7 AuthorizationPolicies)3.
+
+To successfully enable Ambient Mode, the OpenShift cluster is installed with FIPS mode disabled6. While the Luna HSM and underlying RHEL nodes strictly support FIPS boundaries, certain memory leak issues and cryptographic library incompatibilities historically manifest when client certificate forwarding (forward\_client\_cert\_details) is utilized in highly dense mTLS environments under strict FIPS enforcement6. By disabling cluster-wide FIPS mode, Ambient Mode's ztunnel components can leverage highly optimized eBPF (Extended Berkeley Packet Filter) and kernel-level TLS acceleration without hitting the constraints of the certified cryptographic modules, enabling line-rate encryption between nodes.
+
+In this architecture, STRICT mTLS is enforced globally. Team A and Team B are cryptographically prevented from communicating. Even if a standard Kubernetes NetworkPolicy is accidentally misconfigured by a local namespace administrator to allow cross-namespace traffic, the Istio AuthorizationPolicy, enforced by the ztunnel, will reject the connection. The cryptographic identity (SPIFFE ID) of Team A's service account is fundamentally unauthorized to communicate with Team B's workload, ensuring the guarantee survives misconfigured access-control policies.
+
+### **Active Directory and OpenShift OAuth Proxy**
+
+Developer and end-user access to the cluster and deployed applications is governed centrally by Active Directory (AD).
+
+First, OpenShift authentication is backed by an LDAP provider targeting AD. An OpenShift CronJob executes an LDAP Group Sync mechanism, continuously mapping AD groups to OpenShift RBAC RoleBindings7. This ensures that when an engineer joins the AD group for Team A, they automatically receive admin rights limited exclusively to Team A's OpenShift namespace. This provides self-service multitenancy while strictly containing user privileges.
+
+Second, the internal applications deployed by the teams (e.g., the reference Angular website container) are protected from unauthenticated internal access using the OpenShift OAuth Proxy sidecar pattern. The OAuth Proxy is deployed as a secondary container within the Angular web server's pod9.
+
+The Istio waypoint proxy is configured via an HTTPRoute to route all incoming Layer 7 traffic on port 8443 directly to the OAuth Proxy sidecar. The sidecar intercepts the request, forces an OAuth2 authorization code flow against the OpenShift internal OAuth server (which delegates to AD), and verifies the user's JWT token. Only if the user possesses the correct AD group membership does the sidecar proxy the traffic to the local localhost:8080 port where the Angular application's NGINX server is listening.
+
+The deployment configuration for the OAuth Proxy sidecar requires precise argument passing to enforce the upstream routing and TLS termination:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;containers:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- name: oauth-proxy  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;image: registry.redhat.io/openshift4/ose-oauth-proxy:latest  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;args:  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--provider=openshift  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--https-address=:8443  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--http-address=  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--upstream=http://localhost:8080  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--tls-cert=/etc/tls/private/tls.crt  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--tls-key=/etc/tls/private/tls.key  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--client-secret-file=/var/run/secrets/kubernetes.io/serviceaccount/token  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\- \--openshift-sar={"namespace":"team-a","resource":"pods","verb":"get"}
+
+The \--openshift-sar (Subject Access Review) argument instructs the proxy to query the OpenShift API and ensure the authenticated user actually has RBAC permissions to get pods in the team-a namespace before permitting application access.
+
+## **Open Source Penetration Testing Pipeline**
+
+A core requirement of this architecture is the automated, open-source penetration testing of containerized workloads (such as the reference Angular website container) and its native integration into the OpenShift CI/CD ecosystem. This ensures that no code is permitted to execute in a production-equivalent state without cryptographic proof of having survived a Dynamic Application Security Testing (DAST) sweep.
+
+### **DAST Tool Selection**
+
+For assessing an Angular single-page application (SPA), Static Application Security Testing (SAST) and container vulnerability scanning (e.g., Trivy or RHACS image scanners) are fundamentally insufficient. They analyze the codebase and the static image layers for known Common Vulnerabilities and Exposures (CVEs) but cannot detect runtime misconfigurations, DOM-based Cross-Site Scripting (XSS), or authentication bypasses.
+
+Several open-source DAST options exist, each with varying levels of CI/CD integration maturity:
+
+| Tool | Core Mechanism | SPA / AJAX Support | CI/CD Integration Suitability |
+| :---- | :---- | :---- | :---- |
+| **Nuclei** | Template-based vulnerability scanner | Poor (Relies on static HTTP requests) | High (Fast, YAML-based templates) |
+| **Arachni** | Ruby-based crawler and scanner | Moderate (PhantomJS integration) | Low (Project is largely unmaintained) |
+| **OWASP ZAP** | Active intercepting proxy and spider | High (Headless browser AJAX spidering) | High (Official container images, mature API) |
+
+The OWASP Zed Attack Proxy (ZAP) is selected as the industry standard for open-source DAST10. ZAP operates by spidering the deployed application and executing a barrage of active attacks against the endpoints. Because the Angular application relies heavily on client-side rendering and asynchronous API calls, ZAP is executed in its "AJAX Spider" mode, which utilizes headless browsers to render the Document Object Model (DOM) and execute JavaScript before attempting payload injections.
+
+### **Integration into OpenShift CI/CD (Tekton)**
+
+The pipeline is constructed using Red Hat OpenShift Pipelines, which is based on the open-source Tekton project10. Tekton defines pipelines as standard Kubernetes Custom Resources (Task, Pipeline, PipelineRun), completely abstracting traditional CI/CD engines like Jenkins.
+
+The pipeline workflow executes as follows:
+
+> 1. **Source to Image:** A Tekton Task clones the application repository, compiles the Angular assets, and utilizes Buildah in an unprivileged container to construct the OCI image, pushing it to the internal OpenShift Image Registry.  
+> 2. **Ephemeral Staging Deployment:** Tekton deploys the container into an ephemeral, isolated testing namespace. It generates a temporary Route to expose the application to the cluster network.  
+> 3. **Authentication Seeding:** Because the Angular application is protected by the OpenShift OAuth Proxy, ZAP cannot anonymously spider it. The Tekton task utilizes a temporary service account token, injecting it into ZAP's HTTP sender configuration to allow ZAP to bypass the OAuth proxy and assess the underlying application.  
+> 4. **DAST Execution:** A Tekton Task utilizing the official OWASP ZAP container image executes the zap-baseline.py script against the staging route.  
+> 5. **Result Parsing and Teardown:** ZAP outputs a detailed JSON report. A subsequent Tekton step parses this JSON using jq. If any critical or high vulnerabilities are detected, the pipeline fails, the ephemeral environment is destroyed, and the image is marked as insecure. If the scan returns clean, the pipeline proceeds to the cryptographic attestation phase.
+
+The Tekton Task for executing the OWASP ZAP baseline scan leverages the packaged ZAP automation framework. The task must explicitly define the target URL and the location for the JSON output report:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+YAML
+
+apiVersion: tekton.dev/v1beta1  
+kind: Task  
+metadata:  
+&nbsp;&nbsp;name: owasp-zap-dast  
+spec:  
+&nbsp;&nbsp;workspaces:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- name: reports  
+&nbsp;&nbsp;params:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- name: TARGET\_URL  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;type: string  
+&nbsp;&nbsp;steps:  
+&nbsp;&nbsp;&nbsp;&nbsp;\- name: zap-baseline  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;image: ghcr.io/zaproxy/zaproxy:stable  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;script: |  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\#\!/bin/sh  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;mkdir \-p $(workspaces.reports.path)/zap  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;zap-baseline.py \-t $(params.TARGET\_URL) \\  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\-J zap-report.json \\  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\-d \\  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\-r zap-report.html  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;cp /zap/wrk/zap-report.json $(workspaces.reports.path)/zap/
+
+## **Zero-Trust Security & Cryptographic Key Flow**
+
+If the Tekton pipeline completes the OWASP ZAP scan successfully, the system must generate a cryptographic signature proving the container passed the test. This guarantee must survive beyond the pipeline execution; it must be permanently bound to the container image digest in the registry, ensuring that if a deployment policy is bypassed or a human error occurs, the cluster admission controller still rejects the payload.
+
+This architecture treats "Secure by Design" as the total removal of human interaction with cryptographic material. The key flow spans from the HSM to Vault, through Tekton Chains, into an in-toto attestation, and finally to RHACS policy enforcement.
+
+### **Vault Transit Engine and Cryptographic Signing**
+
+HashiCorp Vault is configured to utilize the Transit Secrets Engine14. The Transit engine operates as "Cryptography as a Service"14. Instead of Vault generating a private key and transmitting it to a client (like Tekton or a developer), the Transit engine generates the key internally and never exports it. Clients transmit payload data to Vault's /transit/sign API endpoint, Vault signs the payload using the private key, and returns only the generated signature15.
+
+For the pen testing pipeline, an ed25519 key (chosen for its modern security curve, short key length, and extremely fast signature generation) is created within the Transit engine specifically for the purpose of signing code16.
+
+Vault access is strictly governed. The Tekton service account authenticates to Vault using the Kubernetes Authentication method18. Vault calls the OpenShift TokenReview API to validate the Tekton pod's projected Service Account Token18. If the token is valid and originates from the authorized CI/CD namespace, Vault maps the identity to a role and issues a short-lived Vault token scoped strictly to a policy that only permits HTTP POST requests to the specific /transit/sign/pen-test-signer endpoint16.
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+Terraform
+
+\# Vault Policy: tekton-signer  
+path "transit/sign/pen-test-signer" {  
+&nbsp;&nbsp;capabilities \= \["update"\]  
+}  
+path "transit/keys/pen-test-signer" {  
+&nbsp;&nbsp;capabilities \= \["read"\]  
+}
+
+### **Attesting the Penetration Test via Tekton Chains and Cosign**
+
+When the OWASP ZAP scan completes successfully, the pipeline utilizes Tekton Chains and the Sigstore cosign utility to cryptographically attest the result.
+
+An attestation is a signed metadata object attached to a software artifact19. Unlike a simple signature (which only proves *who* signed the image), an attestation proves *what* happened to the image during its lifecycle19. The architecture utilizes the in-toto attestation format to package the OWASP ZAP JSON report as a standard Supply chain Levels for Software Artifacts (SLSA) predicate13.
+
+The in-toto specification requires a payloadType and a predicateType19. The Tekton pipeline takes the ZAP JSON report, formats it into an in-toto statement, and invokes cosign attest19.
+
+Crucially, cosign integrates natively with the HashiCorp Vault Transit engine via the hashivault:// Key Management Service (KMS) provider URI22. When the cosign attest command is executed, cosign hashes the in-toto statement locally, establishes a TLS connection to Vault, authenticates using the Kubernetes-injected Vault token, and requests Vault to sign the hash23.
+
+The command executed within the final Tekton Task relies on injected environment variables to route the signing request to the HSM-backed Transit engine23:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+Bash
+
+\#\!/bin/bash  
+export VAULT\_ADDR="https://vault.vault-system.svc:8200"  
+export TRANSIT\_SECRET\_ENGINE\_PATH="transit"
+
+\# Generate the attestation using the ZAP report as a custom predicate  
+cosign attest \\  
+&nbsp;&nbsp;\--key hashivault://pen-test-signer \\  
+&nbsp;&nbsp;\--predicate /workspace/reports/zap/zap-report.json \\  
+&nbsp;&nbsp;\--type https://owasp.org/zap/v1 \\  
+&nbsp;&nbsp;\--yes \\  
+&nbsp;&nbsp;image-registry.openshift-image-registry.svc:5000/team-a/angular-frontend@sha256:abcd1234...
+
+The Luna HSM calculates the cryptographic signature, Vault returns it to cosign, and cosign bundles the signature, the in-toto statement, and the image digest, uploading them to the OpenShift Image Registry as a standard OCI (Open Container Initiative) artifact19. At no point does the CI/CD pipeline, the cluster administrator, or the developer interact with the ed25519 private key. The key remains irreversibly bound to the Vault Transit engine, backed by the Luna HSM13.
+
+### **Enforcing Cryptographic Assurance via Red Hat Advanced Cluster Security (RHACS)**
+
+Generating the attestation fulfills the requirement to document the test, but the architecture must actively enforce its presence. True zero-trust dictates that even if a user bypasses RBAC controls or misconfigures an OpenShift project, the cluster itself must refuse to instantiate the container unless the cryptographic math succeeds.
+
+This enforcement is handled by Red Hat Advanced Cluster Security (RHACS), utilizing its Validating Admission Webhook. RHACS intercepts every request sent to the OpenShift API server to create a Pod or Deployment25.
+
+RHACS version 4.x natively supports Sigstore cosign signature verification27. To configure this, the public key associated with the Vault Transit pen-test-signer key is exported from Vault and loaded into the RHACS Central console as a "Signature Integration"30.
+
+Next, a custom RHACS Security Policy is defined. The policy criteria mandate that any image deployed into the team-a or team-b namespaces must possess a valid signature that cryptographically verifies against the Vault public key integration27. Because the attestation itself is a specialized form of a Cosign signature, RHACS verifies the cryptographic hash appended to the OCI registry manifest19.
+
+The underlying JSON schema representing the RHACS policy requires strict enforcement configurations for the admission controller32:
+
+&nbsp;
+
+&nbsp;
+
+&nbsp;
+
+JSON
+
+{  
+&nbsp;&nbsp;"name": "Require ZAP DAST Attestation",  
+&nbsp;&nbsp;"description": "Enforces that all deployed images have a valid in-toto attestation signed by the Vault Transit Engine.",  
+&nbsp;&nbsp;"rationale": "Prevents the execution of code that has not passed the mandated OWASP ZAP penetration test pipeline.",  
+&nbsp;&nbsp;"severity": "CRITICAL\_SEVERITY",  
+&nbsp;&nbsp;"lifecycleStages": \[  
+&nbsp;&nbsp;&nbsp;&nbsp;"DEPLOY"  
+&nbsp;&nbsp;\],  
+&nbsp;&nbsp;"policySections": \[  
+&nbsp;&nbsp;&nbsp;&nbsp;{  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"policyGroups": \[  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"fieldName": "Image Signature Verified By",  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"values": \[  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;"value": "vault-transit-pen-test-signer-integration"  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\]  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;}  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;\]  
+&nbsp;&nbsp;&nbsp;&nbsp;}  
+&nbsp;&nbsp;\],  
+&nbsp;&nbsp;"enforcementActions": \[  
+&nbsp;&nbsp;&nbsp;&nbsp;"ENFORCE\_ON\_DEPLOY"  
+&nbsp;&nbsp;\]  
+}
+
+If a developer attempts to manually push a locally built Angular container directly to the cluster, bypassing the Tekton ZAP pipeline, the container will lack the in-toto attestation signature in the OCI registry.
+
+When the OpenShift API attempts to deploy the workload, the RHACS Validating Admission Webhook halts the request, inspects the registry, finds no valid signature matching the Vault public key, and instantly rejects the admission request. The developer receives an Admission Webhook Denied error explicitly stating that the image lacks the required penetration testing attestation.
+
+This creates an unbreakable chain of custody. The Luna HSM protects the key material, Vault provides programmatic and audited access to the signing mechanism, Tekton automates the security testing and attestation generation, and RHACS ensures that only mathematically proven artifacts ever reach the hardware compute layer. By linking rigid physical hardware boundaries with programmatic zero-trust enforcement, the architecture achieves a highly resilient, multi-tenant ecosystem.
+
+#### **Works cited**
+
+> 1. Setting Up kubectl: Installation Guide | PDF \- Scribd, [https://www.scribd.com/document/708097288/Kubernetes-Tasks](https://www.scribd.com/document/708097288/Kubernetes-Tasks)  
+> 2. Tech Preview of CNF Acceleration Evaluation Using Nvidia, [https://networking-docs.nvidia.com/sol/tech-preview-of-cnf-acceleration-evaluation-using-nvidia-accelerated-network-computing](https://networking-docs.nvidia.com/sol/tech-preview-of-cnf-acceleration-evaluation-using-nvidia-accelerated-network-computing)  
+> 3. Introducing OpenShift Service Mesh 3.1 \- Red Hat, [https://www.redhat.com/en/blog/introducing-openshift-service-mesh-31](https://www.redhat.com/en/blog/introducing-openshift-service-mesh-31)  
+> 4. Red Hat OpenShift Service Mesh 3.4 Installing, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_service\_mesh/3.4/pdf/installing/Red\_Hat\_OpenShift\_Service\_Mesh-3.4-Installing-en-US.pdf](https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.4/pdf/installing/Red_Hat_OpenShift_Service_Mesh-3.4-Installing-en-US.pdf)  
+> 5. Red Hat OpenShift Virtualization アップデートまとめ：機能強化の, [https://rheb.hatenablog.com/entry/openshift-virtualization-update-history](https://rheb.hatenablog.com/entry/openshift-virtualization-update-history)  
+> 6. Red Hat OpenShift Service Mesh 3.3 Release Notes, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_service\_mesh/3.3/pdf/release\_notes/Red\_Hat\_OpenShift\_Service\_Mesh-3.3-Release\_Notes-en-US.pdf](https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.3/pdf/release_notes/Red_Hat_OpenShift_Service_Mesh-3.3-Release_Notes-en-US.pdf)  
+> 7. OCP Articles: Other articles \- CertDepot, [https://www.certdepot.net/ocp-other-articles/](https://www.certdepot.net/ocp-other-articles/)  
+> 8. RHSA-2023:5006 \- Security Advisory \- Red Hat Customer Portal, [https://access.redhat.com/errata/RHSA-2023:5006](https://access.redhat.com/errata/RHSA-2023:5006)  
+> 9. How to use Openshift OAuth server as authentication provider for my, [https://stackoverflow.com/questions/64692264/how-to-use-openshift-oauth-server-as-authentication-provider-for-my-web-app-runn](https://stackoverflow.com/questions/64692264/how-to-use-openshift-oauth-server-as-authentication-provider-for-my-web-app-runn)  
+> 10. DevOps-Interview-Questions/ci-cd/README.md at master \- GitHub, [https://github.com/NotHarshhaa/DevOps-Interview-Questions/blob/master/ci-cd/README.md](https://github.com/NotHarshhaa/DevOps-Interview-Questions/blob/master/ci-cd/README.md)  
+> 11. CI/CD pipeline spiegate: dal primo commit alla produzione, [https://vicedominisoftworks.com/blog/ci-cd-pipeline](https://vicedominisoftworks.com/blog/ci-cd-pipeline)  
+> 12. Sitemap webhosting \- MyDreams Hosting, [https://www.mydreams.cz/en/sitemap.html](https://www.mydreams.cz/en/sitemap.html)  
+> 13. Next-gen supply chain security with HashiCorp Vault and Tekton, [https://medium.com/hashicorp-engineering/next-gen-supply-chain-security-with-hashicorp-vault-and-tekton-chains-8e1cd95ab94f](https://medium.com/hashicorp-engineering/next-gen-supply-chain-security-with-hashicorp-vault-and-tekton-chains-8e1cd95ab94f)  
+> 14. Transit secrets engine | Vault \- HashiCorp Developer, [https://developer.hashicorp.com/vault/docs/secrets/transit](https://developer.hashicorp.com/vault/docs/secrets/transit)  
+> 15. Hashicorp Vault: Transit Secrets Engine \- DEV Community, [https://dev.to/admantium/hashicorp-vault-transit-secrets-engine-2kam](https://dev.to/admantium/hashicorp-vault-transit-secrets-engine-2kam)  
+> 16. How to Implement Vault Transit Signing \- OneUptime, [https://oneuptime.com/blog/post/2026-01-30-vault-transit-signing/view](https://oneuptime.com/blog/post/2026-01-30-vault-transit-signing/view)  
+> 17. How to bring PKI and Transit engine together? \- HashiCorp Discuss, [https://discuss.hashicorp.com/t/how-to-bring-pki-and-transit-engine-together/73488](https://discuss.hashicorp.com/t/how-to-bring-pki-and-transit-engine-together/73488)  
+> 18. Secure Tekton CI/CD secrets with HashiCorp Vault, [https://developer.hashicorp.com/well-architected-framework/secure-systems/secure-applications/ci-cd-secrets/tekton](https://developer.hashicorp.com/well-architected-framework/secure-systems/secure-applications/ci-cd-secrets/tekton)  
+> 19. Sigstore | Kyverno, [https://kyverno.io/docs/policy-types/cluster-policy/verify-images/sigstore/](https://kyverno.io/docs/policy-types/cluster-policy/verify-images/sigstore/)  
+> 20. Programme bootcamp Zeroday Cyber : modules détaillés 2026, [https://www.zerodaycyberacademy.com/ressources/reconversion/contenu-programme-bootcamp-zeroday-detail](https://www.zerodaycyberacademy.com/ressources/reconversion/contenu-programme-bootcamp-zeroday-detail)  
+> 21. cosign — Code signing and transparency for containers and binaries, [https://kitploit.com/en/tools/github/sigstore/cosign](https://kitploit.com/en/tools/github/sigstore/cosign)  
+> 22. Overview \- Sigstore, [https://docs.sigstore.dev/cosign/key\_management/overview/](https://docs.sigstore.dev/cosign/key_management/overview/)  
+> 23. Container Image Signing and Verification in Jenkins CI/CD with, [https://medium.com/@godfreyifeanyi50/container-image-signing-and-verification-in-jenkins-ci-cd-with-sigstore-cosign-and-hashicorp-vault-0dc522a5488f](https://medium.com/@godfreyifeanyi50/container-image-signing-and-verification-in-jenkins-ci-cd-with-sigstore-cosign-and-hashicorp-vault-0dc522a5488f)  
+> 24. Hashicorp Integration with Tekton Chains, [https://tekton.dev/docs/chains/hashicorp-integration-tutorial/](https://tekton.dev/docs/chains/hashicorp-integration-tutorial/)  
+> 25. Harden & Lockdown RKE2 Cluster with a 4-Layer DevSecOps Stack, [https://georgeezejiofor.com/harden-lockdown-rke2-4-layer-devsecops-stack](https://georgeezejiofor.com/harden-lockdown-rke2-4-layer-devsecops-stack)  
+> 26. StackRox Kubernetes Security Platform Guide, [https://www.product-security.expert/09-container-and-kubernetes-security/stackrox-kubernetes-security-platform-guide.html](https://www.product-security.expert/09-container-and-kubernetes-security/stackrox-kubernetes-security-platform-guide.html)  
+> 27. Chapter 13\. Verifying image signatures \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/4.2/html/operating/verify-image-signatures](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/4.2/html/operating/verify-image-signatures)  
+> 28. Red Hat Advanced Cluster Security for Kubernetes 4.8 Operating, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/4.8/pdf/operating/Red\_Hat\_Advanced\_Cluster\_Security\_for\_Kubernetes-4.8-Operating-en-US.pdf](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/4.8/pdf/operating/Red_Hat_Advanced_Cluster_Security_for_Kubernetes-4.8-Operating-en-US.pdf)  
+> 29. Chapter 9\. Verifying image signatures | Operating | Red Hat, [https://docs.redhat.com/es/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/3.70/html/operating/verify-image-signatures](https://docs.redhat.com/es/documentation/red_hat_advanced_cluster_security_for_kubernetes/3.70/html/operating/verify-image-signatures)  
+> 30. Red Hat Advanced Cluster Security for Kubernetes 4.10 Operating, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/4.10/pdf/operating/Red\_Hat\_Advanced\_Cluster\_Security\_for\_Kubernetes-4.10-Operating-en-US.pdf](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/4.10/pdf/operating/Red_Hat_Advanced_Cluster_Security_for_Kubernetes-4.10-Operating-en-US.pdf)  
+> 31. How to integrate Cosign image signature with RHACS to enhance, [https://www.redhat.com/en/blog/how-to-integrate-cosign-image-signature-with-rhacs-to-enhance-the-security-of-the-software-supply-chain](https://www.redhat.com/en/blog/how-to-integrate-cosign-image-signature-with-rhacs-to-enhance-the-security-of-the-software-supply-chain)  
+> 32. Sigstore and StackRox \- RXRW, [https://www.stb.id.au/blog/sigstore-and-stackrox](https://www.stb.id.au/blog/sigstore-and-stackrox)
