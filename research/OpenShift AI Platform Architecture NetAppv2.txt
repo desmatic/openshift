@@ -1,0 +1,390 @@
+# **Secure Multi-Tenant OpenShift Architecture: Zero-Trust and Cryptographic Isolation in the AI Era**
+
+## **Architectural Intent and System Boundaries**
+
+The rapid integration of generative artificial intelligence, large language models (LLMs), and high-throughput vector processing into enterprise workloads mandates a paradigm shift in platform architecture. In highly regulated, multi-tenant environments, security must serve as an enabler of developer velocity rather than a restrictive bottleneck. The target architecture detailed in this report outlines a comprehensive, expert-level implementation of a secure multi-tenant Red Hat OpenShift platform, engineered explicitly for high-performance AI workloads while enforcing strict zero-trust principles.  
+The foundational design philosophy dictates that development teams consume purely native Kubernetes Application Programming Interfaces (APIs)—such as Namespaces, PersistentVolumeClaims, and Services—without ever interacting directly with the underlying infrastructure. Storage arrays, hardware security modules (HSMs), and hypervisors remain entirely abstracted. Multi-tenancy is established through overlapping, redundant boundaries involving network access controls, Role-Based Access Control (RBAC), node-level segregation, and continuous cryptographic verification.  
+The primary architectural mandate requires that distinct operational teams (e.g., Team A and Team B) occupy dedicated namespaces characterized by absolute isolation at both the access-control and cryptographic layers. Furthermore, differing deployment environments, specifically Development and Production, are segregated into dedicated, independent service meshes. This isolation guarantees that a compromise, misconfiguration, or vulnerability exploitation within the Development mesh cannot cryptographically or logically intercept, spoof, or disrupt the Production mesh. This structural isolation directly addresses the strict attribute-based access control (ABAC) and microsegmentation guidelines articulated in the National Institute of Standards and Technology (NIST) Special Publication 800-204 series1.
+
+## **Hardware and Infrastructure Stack Specification**
+
+The physical hardware and infrastructure abstraction layers are explicitly curated to maximize computational throughput for AI inference and vector database queries while maintaining hardware-backed cryptographic integrity. The following table summarizes the core infrastructural components.
+
+| Component Category | Hardware / Software Selection | Primary Function and Architectural Role |
+| :---- | :---- | :---- |
+| **Compute & Acceleration** | HPE ProLiant DL380 Gen12, Dual Intel Xeon 6, 144 Cores, 4TB DDR5 | High-density host nodes providing the computational foundation for OpenShift worker nodes. |
+| **GPU Acceleration** | 3x NVIDIA L4 GPUs (24GB GDDR6, Ada Lovelace) per node | High-throughput AI inference and vector processing, managed via the NVIDIA GPU Operator. |
+| **Storage Platform** | NetApp AFF A900 | All-flash storage array providing persistent volumes via NetApp Trident CSI. |
+| **Orchestration & Database** | Red Hat OpenShift, CloudNativePG (CNPG) | Container orchestration and PostgreSQL operator with PostgresML and pgvector extensions. |
+| **Hardware Root of Trust** | Thales Luna Network S750 HSM | FIPS 140-2 Level 3 hardware security module for cryptographic key generation and storage. |
+| **Secrets Management** | HashiCorp Vault Enterprise | Centralized dynamic secrets, intermediate CA management, and database credential brokering. |
+
+### **Computational Tuning and Accelerated Inference**
+
+The compute tier relies on the HPE ProLiant DL380 Gen12 architecture. Given the memory-intensive nature of large language models and vector similarity searches, avoiding cross-socket memory latency is critical. Non-Uniform Memory Access (NUMA) alignment dictates that memory and Peripheral Component Interconnect Express (PCIe) devices (such as the NVIDIA L4 GPUs) accessed by a specific CPU core must physically reside on the same CPU socket's memory controller. Without strict NUMA alignment, a Kubernetes pod might be allocated an NVIDIA GPU on NUMA node 0 while its assigned CPU cores reside on NUMA node 1\. The resulting cross-Ultra Path Interconnect (UPI) traffic introduces a 15% to 30% performance degradation, which is highly detrimental to low-latency AI inference4.  
+To resolve this, the OpenShift TopologyManager is utilized in conjunction with the CPU Manager. The TopologyManager coordinates resource assignments from the CPU Manager, Device Manager, and Memory Manager. The following table outlines the available policy options within OpenShift and their architectural implications5.
+
+| Topology Manager Policy | Admission Behavior | Architectural Fit for AI Workloads |
+| :---- | :---- | :---- |
+| none | No topology alignment. | Unsuitable; guarantees cross-NUMA latency degradation. |
+| best-effort | Attempts alignment but admits the pod even if alignment fails. | Unsuitable for production AI; introduces unpredictable performance variability. |
+| restricted | Rejects the pod if actual allocation requires more NUMA nodes than the theoretical minimum. | Acceptable for mixed workloads, but does not guarantee single-socket performance. |
+| single-numa-node | Rejects the pod if all requested resources cannot be fulfilled by a single NUMA node. | **Optimal**; guarantees maximum throughput and minimum latency for GPU workloads. |
+
+To enforce the single-numa-node policy, a KubeletConfig custom resource is applied exclusively to the worker nodes housing the NVIDIA GPUs via a dedicated MachineConfigPool4. The cpuManagerPolicy must be set to static, which requires pods to be in the Guaranteed Quality of Service (QoS) class (where resource requests equal limits) with integer CPU requests5.
+
+YAML  
+apiVersion: machineconfiguration.openshift.io/v1  
+kind: KubeletConfig  
+metadata:  
+  name: cpumanager-topologymanager-enabled  
+spec:  
+  machineConfigPoolSelector:  
+    matchLabels:  
+      machineconfiguration.openshift.io/role: worker-gpu  
+  kubeletConfig:  
+    cpuManagerPolicy: static  
+    cpuManagerReconcilePeriod: 5s  
+    topologyManagerPolicy: single-numa-node  
+    topologyManagerScope: pod  
+    reservedSystemCPUs: "0,1"  
+    memoryManagerPolicy: Static
+
+Multi-tenant consumption of the NVIDIA L4 GPUs is facilitated by the NVIDIA GPU Operator configured for time-slicing8. While Multi-Instance GPU (MIG) provides hardware-level memory partitioning, the NVIDIA L4 architecture (Ada Lovelace) does not support MIG, which is typically reserved for the Ampere and Hopper architectures (e.g., A100, H100)9. Consequently, time-slicing multiplexes tenant workloads across the GPU's compute resources using a temporal scheduler. The GPU Operator allows administrators to define virtual replicas of the physical GPU via a ConfigMap8.
+
+YAML  
+apiVersion: v1  
+kind: ConfigMap  
+metadata:  
+  name: time-slicing-config  
+  namespace: nvidia-gpu-operator  
+data:  
+  L4: |-  
+    version: v1  
+    sharing:  
+      timeSlicing:  
+        resources:  
+        \- name: nvidia.com/gpu  
+          replicas: 4
+
+This configuration divides each physical 24GB L4 GPU into four distinct virtual devices. Because time-slicing does not enforce strict VRAM boundaries at the hardware level, aggressive OpenShift LimitRanges and ResourceQuotas are applied per namespace. These Kubernetes-native controls cap GPU memory allocations at the orchestrator level, mitigating the risk of memory fragmentation or Out-Of-Memory (OOM) disruptions caused by a poorly optimized model deployed by Team A impacting Team B's inference latency9.
+
+### **Storage Cryptography and the Data Platform**
+
+The storage tier relies upon a NetApp AFF A900 array running ONTAP, seamlessly integrated with the OpenShift cluster via the NetApp Trident Container Storage Interface (CSI)11. Trident operates as a dynamic storage orchestrator, translating Kubernetes PersistentVolumeClaim (PVC) requests directly into ONTAP FlexVol creation commands. To adhere to the zero-trust paradigm, developers are restricted to interacting solely with standard Kubernetes APIs (PVCs and StorageClasses); they are entirely prohibited from accessing the NetApp management interfaces or REST APIs11.  
+A critical architectural constraint in high-performance data platforms is the preservation of storage-level data reduction techniques, specifically inline deduplication and compression. If application-layer Transparent Data Encryption (TDE) or hypervisor-level encryption is utilized, the data stream is randomized before it reaches the storage array, rendering ONTAP's deduplication algorithms completely ineffective. To preserve data reduction while ensuring cryptographic security, NetApp Volume Encryption (NVE) is leveraged12.  
+NVE is a software-based encryption mechanism that encrypts data at rest on a per-volume basis using AES-25613. Crucially, encryption within the ONTAP storage stack occurs *after* the data reduction pipeline. This ensures that aggregate-level deduplication efficiencies are fully preserved while simultaneously isolating individual volumes cryptographically14. NVE operates by utilizing unique Volume Encryption Keys (VEKs) for each provisioned volume.  
+To secure these VEKs, ONTAP utilizes the Key Management Interoperability Protocol (KMIP) to communicate with the external Luna Network S750 HSM15. The HSM acts as the ultimate root of trust, generating and storing the authentication keys required to unlock the VEKs. The KMIP integration is established via mutually authenticated Transport Layer Security (mTLS) between the NetApp storage controllers and the Luna HSM appliance.  
+The underlying configuration is executed at the ONTAP administrative level, completely abstracted from the OpenShift users16:
+
+Bash  
+security key-manager external enable \-vserver openshift\_svm \\  
+  \-key-servers luna-hsm.internal.corp:5696 \\  
+  \-client-cert NetAppClientCert \\  
+  \-server-ca-certs LunaCACert
+
+Within OpenShift, the platform engineering team provisions a specific StorageClass configured with Trident backend parameters that force the encryption flag to "true". When a developer in Team A creates a PVC referencing this StorageClass, Trident instructs ONTAP to dynamically provision an NVE-encrypted volume wrapped by the HSM17. This mechanism effortlessly fulfills the compliance requirement for data-at-rest encryption without exposing the underlying cryptographic mechanics to the application layer.
+
+### **Database Orchestration and AI Workload Integration**
+
+To support advanced AI capabilities, the architecture deploys the CloudNativePG (CNPG) Operator. The CNPG Operator natively manages high-availability PostgreSQL clusters within OpenShift namespaces. To facilitate generative AI applications, the PostgreSQL images are augmented with the PostgresML and pgvector extensions18.  
+The pgvector extension allows the database to store, index, and query high-dimensional embeddings generated by LLMs20. Because vector similarity search (e.g., exact nearest neighbor) is computationally expensive, deploying the database pods on the GPU-accelerated worker nodes drastically reduces query latency. The strict NUMA alignment discussed previously ensures that the database processes accessing the pgvector data reside on the same socket as the NVIDIA L4 GPU executing the vector mathematics, eliminating interconnect bottlenecks4.  
+To maintain the zero-trust posture, developers are never provided with static database credentials. Instead, HashiCorp Vault Enterprise is integrated with the CNPG instances using Vault's Database Secrets Engine. Vault dynamically generates short-lived, lease-based PostgreSQL credentials upon request22. An init-container or the Vault Agent Injector sidecar fetches these ephemeral credentials and mounts them into the application pod's memory. When the lease expires, Vault automatically revokes the database role, ensuring that compromised application code or leaked environment variables yield no long-term access to the underlying vector databases.
+
+## **Hardware Root of Trust and Vault Enterprise Integration**
+
+The cryptographic foundation of the entire architecture is anchored by the Thales Luna Network S750 HSM. Operating at FIPS 140-2 Level 3, the HSM provides tamper-evident and tamper-resistant cryptographic key generation and storage23. HashiCorp Vault Enterprise acts as the central secrets management engine and Public Key Infrastructure (PKI) authority, brokering access to the HSM's capabilities.
+
+### **PKCS\#11 Auto-Unseal Mechanism**
+
+By default, Vault encrypts its internal storage using an encryption key. This encryption key is decrypted by a master root key, which is traditionally split into multiple shards using Shamir's Secret Sharing algorithm22. This default posture requires manual human intervention (providing a quorum of key shards) every time a Vault server restarts, which contradicts the automated recovery principles of cloud-native infrastructure.  
+In this architecture, Vault delegates the protection of its master root key to the Luna HSM via the PKCS\#11 standard. The vault.hcl configuration leverages the libCryptoki2\_64.so cryptographic token interface library to communicate directly with an initialized HSM partition26.
+
+Terraform  
+seal "pkcs11" {  
+  lib            \= "/usr/safenet/lunaclient/lib/libCryptoki2\_64.so"  
+  slot           \= "1"  
+  pin            \= "HSM\_PARTITION\_PIN"  
+  key\_label      \= "vault-master-key"  
+  hmac\_key\_label \= "vault-hmac-key"  
+  generate\_key   \= "true"  
+  mechanism      \= "0x0009" \# RSA\_PKCS\_OAEP  
+}
+
+Upon startup, Vault establishes an authenticated session with the Luna HSM. The HSM utilizes the RSA\_PKCS\_OAEP mechanism to securely decrypt the Vault master key within the HSM's tamper-proof boundary, returning the unencrypted master key directly to Vault's secure memory enclave28. This auto-unseal capability enables rapid, unattended pod restarts for the Vault StatefulSet while cryptographically ensuring that the master key material never resides in persistent storage unencrypted24.
+
+### **OpenShift etcd Encryption via KMS v2**
+
+Kubernetes stores all cluster state, configuration data, and sensitive Secret objects within the etcd distributed key-value store. If left unencrypted, a malicious actor gaining read access to the underlying etcd disk files or a misconfigured backup snapshot could effortlessly extract all cluster secrets, service account tokens, and database passwords30.  
+While OpenShift provides a native AES-CBC encryption mechanism for etcd, it relies on locally managed keys stored on the control plane filesystem30. To fulfill enterprise security mandates, this architecture utilizes Kubernetes Key Management Service (KMS) version 2 (supported in OpenShift 4.14+) integrated with Vault Enterprise30.  
+KMS v2 fundamentally alters the encryption architecture to eliminate the performance bottlenecks associated with KMS v1. In KMS v1, the OpenShift API server generated a new Data Encryption Key (DEK) for every single secret written to etcd and made an external API call to the KMS provider to encrypt that DEK. In highly active clusters, this resulted in thousands of API calls per second, overwhelming the KMS and introducing unacceptable latency30.  
+Under the KMS v2 architecture, the OpenShift API server generates a single cryptographic seed at startup. It makes one gRPC call to the Vault KMS plugin (running as a static pod on the control plane nodes). The Vault plugin forwards this seed to Vault's Transit Secrets Engine, which acts as the Key Encryption Key (KEK) authority, encrypting the seed31. The API server caches this encrypted seed in memory and utilizes a local Key Derivation Function (KDF) to generate unique DEKs for every subsequent etcd object locally30.  
+This envelope encryption model ensures high-throughput secret creation while maintaining absolute cryptographic authority within Vault. The configuration is declared via the OpenShift APIServer custom resource:
+
+YAML  
+apiVersion: config.openshift.io/v1  
+kind: APIServer  
+metadata:  
+  name: cluster  
+spec:  
+  encryption:  
+    type: KMS  
+    kms:  
+      name: vault-kms-provider  
+      endpoint: unix:///etc/kubernetes/static-pod-resources/vault-kms.sock  
+      timeout: 3s
+
+If the Vault server becomes unreachable or the transit KEK is actively revoked by a security administrator, the API server cannot decrypt the initial seed upon restart. Consequently, all data within etcd is cryptographically shredded, rendering the cluster state inaccessible and permanently protecting the secrets from exfiltration32.
+
+## **Multi-Mesh Design and RBAC Integration**
+
+A paramount objective of this deployment is the absolute isolation of the Development environment from the Production environment, combined with strict isolation between tenant teams (Team A and Team B) operating within the same environment. This requires a sophisticated integration of Active Directory, OpenShift Role-Based Access Control (RBAC), and OpenShift Service Mesh.
+
+### **Active Directory to RBAC Translation**
+
+Authentication to the OpenShift cluster is brokered via an OAuth integration with the corporate Active Directory (AD). An LDAP Group Sync mechanism periodically maps AD security groups to OpenShift Group objects. This allows the platform engineering team to manage identity lifecycle centrally within AD.
+
+| Active Directory Group | OpenShift Group | OpenShift ClusterRoleBinding | Permitted Namespace |
+| :---- | :---- | :---- | :---- |
+| GG-OCP-Dev-TeamA | ocp-dev-team-a | admin (Namespaced) | dev-team-a |
+| GG-OCP-Dev-TeamB | ocp-dev-team-b | admin (Namespaced) | dev-team-b |
+| GG-OCP-Prod-TeamA | ocp-prod-team-a | admin (Namespaced) | prod-team-a |
+
+By assigning the localized admin role strictly within their designated namespaces, Team A possesses self-service capabilities (e.g., creating Deployments, Services, and PVCs) within dev-team-a, but completely lacks the RBAC permissions required to view, modify, or list resources in dev-team-b or any Production namespace. This API-level restriction forms the first boundary of the zero-trust posture.
+
+### **Deploying the Multi-Mesh Architecture**
+
+While RBAC restricts API interaction, it does not prevent a compromised container in dev-team-a from attempting to open a network socket to a database pod in prod-team-a. Standard Kubernetes NetworkPolicies can drop this traffic at the Container Network Interface (CNI) layer, but IP addresses can be spoofed by sophisticated adversaries33.  
+To guarantee that Development workloads cannot interact with Production workloads, the architecture eschews a single, cluster-wide service mesh. Instead, two entirely separate OpenShift Service Mesh control planes are deployed—one dedicated to Development and one to Production. Following "The Red Hat Way," the newer Istio Sail Operator is utilized to provision these distinct Istio instances35.  
+The Development control plane is configured to discover and manage proxies only within namespaces labeled with istio.io/rev: dev, while the Production control plane manages namespaces labeled istio.io/rev: prod. Because the control planes are distinct, service discovery endpoints are isolated. A proxy in the Development mesh possesses no routing information or endpoint telemetry regarding services in the Production mesh, preventing accidental or malicious cross-environment traffic routing.
+
+## **Cryptographic Assurances and PKI Isolation**
+
+The multi-mesh design's ultimate enforcement mechanism relies on cryptographic isolation. Even if network firewalls fail and routing tables are compromised, a connection between distinct environments or unauthorized teams must fail during the mutual TLS (mTLS) handshake1.
+
+### **Mesh A to Mesh B (Development vs. Production)**
+
+Istio proxies rely on X.509 certificates to perform mTLS. By default, Istio utilizes a built-in Certificate Authority (istiod) that generates a self-signed root certificate. This is unacceptable for enterprise security38. To anchor the service meshes to the hardware root of trust, the cert-manager operator and the istio-csr agent are deployed38.  
+The istio-csr agent intercepts all Certificate Signing Requests (CSRs) originating from the mesh data plane and forwards them to cert-manager, which utilizes Vault as the external issuer39. To cryptographically divorce the meshes, two separate PKI secrets engines are instantiated in Vault: one acting as the Intermediate CA for Development, and another for Production.  
+Furthermore, each mesh is configured with a unique SPIFFE trust domain42. The IstioCSR configuration for the Development environment explicitly targets the Development issuer and trust domain:
+
+YAML  
+apiVersion: operator.openshift.io/v1alpha1  
+kind: IstioCSR  
+metadata:  
+  name: dev-istio-csr  
+  namespace: istio-system-dev  
+spec:  
+  istioCSRConfig:  
+    certManager:  
+      issuerRef:  
+        name: vault-dev-issuer  
+        kind: Issuer  
+        group: cert-manager.io  
+    istiodTLSConfig:  
+      trustDomain: dev.local
+
+Because the Development and Production meshes rely on different Intermediate CAs and distinct trust domains (dev.local vs. prod.local), cryptographic assurance is absolute. If a compromised workload in the Development mesh attempts an mTLS handshake with a proxy in the Production mesh, the receiving proxy evaluates the certificate chain37. It immediately identifies that the presenting certificate was signed by an unrecognized Intermediate CA and belongs to an untrusted domain. The TLS connection is forcibly terminated before any HTTP headers or application payloads are transmitted.
+
+### **Team A to Team B (Intra-Environment Isolation)**
+
+Within the same mesh (e.g., the Development environment), Team A and Team B share the same Intermediate CA and the same trust domain (dev.local). Cryptographic assurance between these teams is not achieved through CA segregation, but rather through strict cryptographic identity verification and Layer 7 policy enforcement42.  
+Every workload receives a certificate encoding its unique SPIFFE identity, identifying its specific namespace and service account (e.g., spiffe://dev.local/ns/dev-team-a/sa/frontend-sa). Istio is configured in STRICT mTLS mode across the entire mesh37. To isolate the teams, a default-deny AuthorizationPolicy is applied to the data plane37.
+
+YAML  
+apiVersion: security.istio.io/v1beta1  
+kind: AuthorizationPolicy  
+metadata:  
+  name: default-deny-cross-tenant  
+  namespace: istio-system-dev  
+spec:  
+  action: DENY  
+  rules:  
+  \- from:  
+    \- source:  
+        namespaces: \["dev-team-a"\]  
+    to:  
+    \- operation:  
+        methods: \["\*"\]  
+  selector:  
+    matchLabels:  
+      istio.io/rev: dev
+
+When a workload in Team A attempts to communicate with Team B, the mTLS handshake succeeds because both certificates are signed by the dev.local CA. However, upon decryption, the receiving proxy inspects the validated SPIFFE ID embedded in the client's certificate. The proxy consults the AuthorizationPolicy, recognizes that traffic from the dev-team-a namespace is prohibited, and instantly rejects the connection with an HTTP 403 Forbidden status code. This workflow perfectly aligns with the NIST SP 800-204B guidelines for Attribute-Based Access Control (ABAC) mediated by a service mesh2.
+
+## **Ambient Mode Deep Dive and Architectural Considerations**
+
+OpenShift Service Mesh 3 introduces Ambient Mode, a sidecar-less data plane architecture that drastically reduces the computational and memory overhead associated with injecting Envoy sidecars into every application pod46. Ambient mode separates proxy responsibilities into two distinct tiers: a per-node Layer 4 proxy known as ztunnel (Zero Trust Tunnel), and an optional, scalable Layer 7 proxy known as a Waypoint49.
+
+### **Design Decisions: ztunnel and Waypoint Placement**
+
+The lightweight, Rust-based ztunnel is deployed as a DaemonSet on every worker node37. It intercepts traffic dynamically and establishes mTLS tunnels (using the HTTP-Based Overlay Network Environment, or HBONE protocol) between nodes. However, ztunnel operates strictly at Layer 4; it cannot inspect HTTP headers or enforce Layer 7 AuthorizationPolicies51.  
+To enforce the cross-tenant isolation policies required between Team A and Team B, Layer 7 inspection is mandatory51. Therefore, traffic must be directed through a Waypoint proxy. The critical architectural decision in Ambient mode revolves around the scope of the Waypoint deployment48.  
+If a single cluster-wide Waypoint proxy is utilized, all tenant traffic funnels through a shared memory space. This violates the zero-trust microsegmentation principles and introduces the risk of "noisy neighbor" resource exhaustion (where a traffic spike from Team A degrades Team B's performance), directly corresponding to Threat Scenario TR-5 ("Compromise of Shared L7 Proxy") detailed in NIST SP 800-23354.  
+To mitigate this, Waypoint proxies are strictly deployed on a **per-namespace** basis48. Team A and Team B each receive dedicated Waypoint proxies. The ztunnel intelligently routes traffic requiring Layer 7 evaluation to the specific namespace's Waypoint, guaranteeing fault isolation and discrete resource consumption mapping51.
+
+### **FIPS Mode Implications for Ambient Mesh**
+
+Federal and highly regulated enterprise environments mandate the use of cryptographic modules validated by the Cryptographic Module Validation Program (CMVP) under the FIPS 140-2 or FIPS 140-3 standards55. OpenShift enforces this via a cluster-wide FIPS mode, which configures the underlying Red Hat Enterprise Linux CoreOS to utilize the validated Network Security Services (NSS) cryptographic libraries.  
+Historically, the Rust-based ztunnel faced significant technical hurdles in achieving FIPS compliance, as integrating Rust runtimes with FIPS-validated BoringSSL or NSS bindings was complex49. To experiment with Ambient mode, administrators frequently disabled OpenShift's FIPS mode.  
+Disabling FIPS mode carries severe architectural implications:
+
+> 1. **Compliance Invalidation**: The entire platform immediately fails compliance audits for frameworks such as FedRAMP, the Payment Card Industry Data Security Standard (PCI DSS), and HIPAA, as unvalidated cryptographic modules are used for data-in-transit56.  
+> 2. **Cryptographic Fallback**: The ztunnel reverts to utilizing standard, non-validated cryptography libraries (e.g., default rustls). While these libraries implement mathematically sound algorithms (like ChaCha20-Poly1305), they lack the rigorous supply-chain vetting, source code auditing, and entropy verifications mandated by NIST standards.
+
+To preserve the zero-trust posture, FIPS mode must remain enabled. Recent releases of OpenShift Service Mesh have introduced FIPS 140-2 compliance for Ambient mode by integrating TLS 1.2 support into the ztunnel architecture, eliminating the need to compromise the cluster's regulatory standing55.
+
+### **Cryptographic Isolation Consequences in Ambient Mode**
+
+The most significant security consequence of adopting Ambient mode in a multi-mesh environment relates to the ztunnel deployment pattern. Because ztunnel operates as a per-node DaemonSet, it acts as a shared L4 proxy for *all* workloads executing on that physical host54.  
+To terminate and originate mTLS connections, the ztunnel must hold the private keys and X.509 certificates for every co-located workload in its memory space41. If the Development mesh and the Production mesh share the same physical worker nodes, the shared ztunnel process is required to hold certificates issued by both the Development Vault CA and the Production Vault CA41.  
+This configuration fundamentally violates strict cryptographic isolation. As outlined in NIST SP 800-233 Threat Scenario TR-1 ("Compromised L4 Proxy"), if an advanced persistent threat exploits a vulnerability within the ztunnel process from a compromised Development workload, the attacker could theoretically access the memory space containing the Production environment's private key material54.  
+**Architectural Mitigation:**  
+To guarantee absolute cryptographic isolation between Mesh A (Development) and Mesh B (Production) while utilizing Ambient mode, the platform must enforce strict physical segregation of the workloads. This is achieved by creating distinct MachineConfigPools and dedicated worker node sets for each environment.
+
+| Component | Node Pool Label | Toleration / NodeSelector | Resulting ztunnel Cryptographic Scope |
+| :---- | :---- | :---- | :---- |
+| **Development Workloads** | node-role.kubernetes.io/dev-worker | env: dev | Holds exclusively dev.local CA certificates. |
+| **Production Workloads** | node-role.kubernetes.io/prod-worker | env: prod | Holds exclusively prod.local CA certificates. |
+
+By utilizing OpenShift node selectors and taints, Development pods are scheduled exclusively onto Development worker nodes. Consequently, the ztunnel DaemonSet on a Development node only ever interacts with and stores dev.local certificates. This node-level segregation guarantees that a critical vulnerability within the Development proxy layer cannot expose Production cryptographic material, effectively neutralizing the TR-1 threat vector while preserving the operational efficiencies of Ambient mode52.
+
+## **Advanced Network Security and Node-to-Node Encryption**
+
+While the service mesh secures pod-to-pod communication at Layer 4 and Layer 7, a comprehensive zero-trust architecture must also protect infrastructure-level communication that bypasses the mesh entirely. This includes Kubelet telemetry, internal DNS lookups, and OpenShift Software-Defined Networking (SDN) control plane traffic.
+
+### **OVN-Kubernetes IPsec Encryption**
+
+OpenShift 4 utilizes OVN-Kubernetes as its default Container Network Interface (CNI)60. To fulfill the mandate that all data-in-flight is encrypted, OVN-Kubernetes is configured to enable IPsec encryption for all node-to-node traffic62.  
+When IPsec is enabled, OVN-Kubernetes automatically generates node-specific cryptographic keys and establishes IPsec Encapsulating Security Payload (ESP) tunnels between all worker and control plane nodes63. This configuration can be dynamically applied to the cluster via an operator patch:
+
+Bash  
+oc patch networks.operator.openshift.io cluster \--type\=merge \\  
+  \-p '{"spec":{"defaultNetwork":{"ovnKubernetesConfig":{"ipsecConfig":{}}}}}'
+
+This guarantees that adversaries performing packet-sniffing attacks on the physical network fabric (e.g., tapping the HPE ProLiant host interfaces) cannot decipher CNI control plane or data plane traffic, enforcing cryptographic privacy regardless of service mesh adoption62.
+
+### **Identity Proxies for Legacy Web Workloads**
+
+Not all containerized applications natively support OpenShift's authentication mechanisms or OpenID Connect (OIDC) flows. To enforce Active Directory group-based access control to HTTP services without altering the underlying application code, the openshift-oauth-proxy is deployed via a sidecar pattern65.  
+The OAuth proxy container sits in front of the application container within the same pod. It intercepts all inbound ingress traffic, redirects unauthenticated users to the OpenShift OAuth server (which synchronizes with Active Directory), validates the returned token, and only proxies authorized requests to the legacy application via the local loopback interface (localhost)67.
+
+YAML  
+apiVersion: apps/v1  
+kind: Deployment  
+metadata:  
+  name: team-a-legacy-dashboard  
+  namespace: dev-team-a  
+spec:  
+  replicas: 1  
+  template:  
+    metadata:  
+      labels:  
+        app: dashboard  
+    spec:  
+      serviceAccountName: proxy-sa  
+      containers:  
+      \- name: oauth-proxy  
+        image: openshift/oauth-proxy:latest  
+        args:  
+        \- \--https-address=:8443  
+        \- \--provider=openshift  
+        \- \--openshift-service-account=proxy-sa  
+        \- \--upstream=http://localhost:8080  
+        \- \--tls-cert=/etc/tls/private/tls.crt  
+        \- \--tls-key=/etc/tls/private/tls.key  
+        \- \--cookie-secret=SECRET  
+        ports:  
+        \- containerPort: 8443  
+          name: public  
+        volumeMounts:  
+        \- mountPath: /etc/tls/private  
+          name: proxy-tls  
+      \- name: application  
+        image: custom-dashboard:v1  
+        ports:  
+        \- containerPort: 8080
+
+This architecture ensures that identity verification occurs at the pod boundary before any business logic is executed, strictly aligning with zero-trust application access models66.
+
+### **Red Hat Advanced Cluster Security (ACS)**
+
+To provide runtime behavioral analysis and vulnerability enforcement, Red Hat Advanced Cluster Security (ACS) is deeply integrated into the stack70. ACS operates by deploying a DaemonSet that monitors extended Berkeley Packet Filter (eBPF) event streams directly from the Linux kernel. This allows ACS to detect anomalous container behavior, such as unexpected binary execution, privilege escalation attempts, or unauthorized network port bindings in real-time71.  
+Furthermore, ACS analyzes the observed network traffic to automatically generate optimized Kubernetes NetworkPolicy YAML manifests72. This microsegmentation visualization ensures that the default-deny namespace boundaries established between Team A and Team B are actively monitored and validated against actual network flow telemetry, providing a continuous feedback loop that satisfies the continuous monitoring requirements of NIST SP 800-204A1.
+
+#### **Works cited**
+
+> 1. Building Secure Microservices-based Applications Using Service, [https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-204A.pdf](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-204A.pdf)  
+> 2. SP 800-204B, Attribute-based Access Control for Microservices, [https://csrc.nist.gov/pubs/sp/800/204/b/final](https://csrc.nist.gov/pubs/sp/800/204/b/final)  
+> 3. NIST.SP.800-204C.pdf, [https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-204C.pdf](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-204C.pdf)  
+> 4. Kubernetes Topology Manager for GPU and NUMA Alignment, [https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/](https://kubernetes.recipes/recipes/ai/kubernetes-topology-manager-gpu-numa/)  
+> 5. Using CPU Manager and Topology Manager \- OKD Documentation, [https://docs.okd.io/4.20/scalability\_and\_performance/using-cpu-manager.html](https://docs.okd.io/4.20/scalability_and_performance/using-cpu-manager.html)  
+> 6. Chapter 7\. Using Topology Manager | OpenShift Container Platform, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.3/html/scalability\_and\_performance/using-topology-manager](https://docs.redhat.com/en/documentation/openshift_container_platform/4.3/html/scalability_and_performance/using-topology-manager)  
+> 7. 1984154 – Allow setting topology-manager-scope when a, [https://bugzilla.redhat.com/show\_bug.cgi?id=1984154](https://bugzilla.redhat.com/show_bug.cgi?id=1984154)  
+> 8. MkDocs Project (rh-aiservices-bu/ai-on-openshift) | Context7, [https://context7.com/rh-aiservices-bu/ai-on-openshift](https://context7.com/rh-aiservices-bu/ai-on-openshift)  
+> 9. Kubernetes for Generative AI Solutions: A complete guide to, [https://dokumen.pub/kubernetes-for-generative-ai-solutions-a-complete-guide-to-designing-optimizing-and-deploying-generative-ai-workloads-on-kubernetes-1.html](https://dokumen.pub/kubernetes-for-generative-ai-solutions-a-complete-guide-to-designing-optimizing-and-deploying-generative-ai-workloads-on-kubernetes-1.html)  
+> 10. Chapter 8\. About GPU time slicing \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_ai\_self-managed/3.4/html/working\_with\_accelerators/about-gpu-time-slicing\_accelerators](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.4/html/working_with_accelerators/about-gpu-time-slicing_accelerators)  
+> 11. NetApp Trident \- Red Hat Ecosystem Catalog, [https://catalog.redhat.com/en/solutions/detail/505404934d434b07a67d1f7146484cd6](https://catalog.redhat.com/en/solutions/detail/505404934d434b07a67d1f7146484cd6)  
+> 12. 6 \- Storage Encryption | Tenable®, [https://www.tenable.com/audits/items/NetApp\_ONTAP\_9\_Hardening\_Guide\_v1.7.0.audit:5eef756f9eacf28ab61c091e74608c1e](https://www.tenable.com/audits/items/NetApp_ONTAP_9_Hardening_Guide_v1.7.0.audit:5eef756f9eacf28ab61c091e74608c1e)  
+> 13. NetApp Volume Encryption Setup with External Key Manager, [https://techmyth.blog/en/posts/ntap-nve-external-key-manager/](https://techmyth.blog/en/posts/ntap-nve-external-key-manager/)  
+> 14. Storage encryption in ONTAP \- NetApp Docs, [https://docs.netapp.com/us-en/ontap-technical-reports/ontap-security-hardening/storage-encryption.html](https://docs.netapp.com/us-en/ontap-technical-reports/ontap-security-hardening/storage-encryption.html)  
+> 15. Introduction to CTE-Efficient Storage \- Thales Docs, [https://thalesdocs.com/ctp/cte-con/cte/7.3.0/integrations/win-int/win-int-win/win-int-storage/index.html](https://thalesdocs.com/ctp/cte-con/cte/7.3.0/integrations/win-int/win-int-win/win-int-storage/index.html)  
+> 16. Enable external key management for NVE in ONTAP 9.6 and later, [https://docs.netapp.com/us-en/ontap/encryption-at-rest/enable-external-key-management-96-later-nve-task.html](https://docs.netapp.com/us-en/ontap/encryption-at-rest/enable-external-key-management-96-later-nve-task.html)  
+> 17. Notes from 'ONTAP 9 NetApp Encryption Power Guide', [http://examcramnotes.blogspot.com/2019/03/notes-from-ontap-9-netapp-encryption.html](http://examcramnotes.blogspot.com/2019/03/notes-from-ontap-9-netapp-encryption.html)  
+> 18. k0rdent Catalog, [https://catalog.k0rdent.io/](https://catalog.k0rdent.io/)  
+> 19. A curated list of awesome C frameworks, libraries and software., [https://github.com/uhub/awesome-c](https://github.com/uhub/awesome-c)  
+> 20. Database interfaces — list of Rust libraries/crates // Lib.rs, [https://lib.rs/database](https://lib.rs/database)  
+> 21. Claude Skill \- SkillHub \- Tencent, [https://skillhub.cloud.tencent.com/skills/awesome-skill](https://skillhub.cloud.tencent.com/skills/awesome-skill)  
+> 22. Deploy OpenBao on OpenShift with HA Raft, TLS, and Static Key, [https://kifarunix.com/deploy-openbao-on-openshift-with-ha-raft-tls/](https://kifarunix.com/deploy-openbao-on-openshift-with-ha-raft-tls/)  
+> 23. Data Sheet v17 \- Batec, [https://batecme.com/wp-content/uploads/2025/02/cdsp-data-security-platform-ds.pdf](https://batecme.com/wp-content/uploads/2025/02/cdsp-data-security-platform-ds.pdf)  
+> 24. HashiCorp Vault with Thales Luna HSMs \- Integration Guide, [https://cpl.thalesgroup.com/resources/encryption/hashicorp-vault-luna-hsm-integration-guide](https://cpl.thalesgroup.com/resources/encryption/hashicorp-vault-luna-hsm-integration-guide)  
+> 25. Seal/Unseal | Vault \- HashiCorp Developer, [https://developer.hashicorp.com/vault/docs/concepts/seal](https://developer.hashicorp.com/vault/docs/concepts/seal)  
+> 26. vault/.release/linux/package/etc/vault.d/vault.hcl at main · hashicorp, [https://github.com/hashicorp/vault/blob/main/.release/linux/package/etc/vault.d/vault.hcl](https://github.com/hashicorp/vault/blob/main/.release/linux/package/etc/vault.d/vault.hcl)  
+> 27. How to install Hashicorp Vault on Ubuntu \- Medium, [https://medium.com/@achatterjee.82/how-to-install-hashicorp-vault-on-ubuntu-a28740a7e88b](https://medium.com/@achatterjee.82/how-to-install-hashicorp-vault-on-ubuntu-a28740a7e88b)  
+> 28. HashiCorp Vault \- Thales Docs, [https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp\_vault/index.html](https://www.thalesdocs.com/gphsm/integrations/guides/hashicorp_vault/index.html)  
+> 29. Overview \- Thales Docs, [https://thalesdocs.com/gphsm/ptk/protectserver3/docs/integration\_docs/hashicorp\_vault/hash\_overview/index.html](https://thalesdocs.com/gphsm/ptk/protectserver3/docs/integration_docs/hashicorp_vault/hash_overview/index.html)  
+> 30. KMS v2 (Kubernetes KMS Provider v2) \- Le Site de François, [https://lesitedefrancois.be/en/security/kmsv2/](https://lesitedefrancois.be/en/security/kmsv2/)  
+> 31. Vault Kubernetes Key Management \- HashiCorp Developer, [https://developer.hashicorp.com/vault/docs/deploy/kubernetes/kms](https://developer.hashicorp.com/vault/docs/deploy/kubernetes/kms)  
+> 32. HashiCorp Ships Public Beta of Vault Kubernetes Key Management, [https://www.infoq.com/news/2026/08/vault-kubernetes-key-management/](https://www.infoq.com/news/2026/08/vault-kubernetes-key-management/)  
+> 33. Why Building Large Kubernetes Clusters Is (Still) a Bad Idea | Solo.io, [https://www.solo.io/blog/why-building-large-kubernetes-clusters-is-still-a-bad-idea](https://www.solo.io/blog/why-building-large-kubernetes-clusters-is-still-a-bad-idea)  
+> 34. NIST SP 800-207A initial public draft, A Zero Trust Architecture, [https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-207A.ipd.pdf](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-207A.ipd.pdf)  
+> 35. Releases · istio-ecosystem/sail-operator \- GitHub, [https://github.com/istio-ecosystem/sail-operator/releases](https://github.com/istio-ecosystem/sail-operator/releases)  
+> 36. Chapter 4\. OpenShift Service Mesh and cert-manager | Installing, [https://docs.redhat.com/en/documentation/red\_hat\_openshift\_service\_mesh/3.0/html/installing/ossm-cert-manager](https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.0/html/installing/ossm-cert-manager)  
+> 37. Service Mesh and Privacy: How Istio and Envoy Enable, [https://stealthcloud.ai/cloud-paradigms/service-mesh-privacy/](https://stealthcloud.ai/cloud-paradigms/service-mesh-privacy/)  
+> 38. Red Hat OpenShift and zero trust: Securing workloads with cert, [https://www.redhat.com/en/blog/red-hat-openshift-and-zero-trust-securing-workloads-cert-manager-and-openshift-service-mesh](https://www.redhat.com/en/blog/red-hat-openshift-and-zero-trust-securing-workloads-cert-manager-and-openshift-service-mesh)  
+> 39. How to secure with openshift service mesh & cert-manager, [https://pronteff.com/securing-workloads-with-openshift-service-mesh-and-cert-manager/](https://pronteff.com/securing-workloads-with-openshift-service-mesh-and-cert-manager/)  
+> 40. Integrate OpenShift Service Mesh with cert-manager and Vault, [https://developers.redhat.com/articles/2023/08/24/integrate-openshift-service-mesh-cert-manager-and-vault](https://developers.redhat.com/articles/2023/08/24/integrate-openshift-service-mesh-cert-manager-and-vault)  
+> 41. Secure your workloads with cert-manager in Istio's ambient mode, [https://www.solo.io/blog/how-to-use-istio-csr-with-ambient](https://www.solo.io/blog/how-to-use-istio-csr-with-ambient)  
+> 42. rvennam/istio-ambient-agentgateway-egress-gateway \- GitHub, [https://github.com/rvennam/istio-ambient-agentgateway-egress-gateway](https://github.com/rvennam/istio-ambient-agentgateway-egress-gateway)  
+> 43. Integrate OpenShift Gateway API with OpenShift Service Mesh, [https://developers.redhat.com/articles/2025/12/09/integrate-openshift-gateway-api-openshift-service-mesh](https://developers.redhat.com/articles/2025/12/09/integrate-openshift-gateway-api-openshift-service-mesh)  
+> 44. Service-to-Service Authentication in Microservices \- AakashX, [https://www.aakashx.com/blog/service-to-service-authentication-microservices/](https://www.aakashx.com/blog/service-to-service-authentication-microservices/)  
+> 45. Attribute-based Access Control for Microservices-based Applications, [https://www.nist.gov/document/presentation-nist-sp-800-204b-attribute-based-access-control-microservices-based](https://www.nist.gov/document/presentation-nist-sp-800-204b-attribute-based-access-control-microservices-based)  
+> 46. Ambient Mode | Solo.io, [https://www.solo.io/topics/ambient/ambient-mode](https://www.solo.io/topics/ambient/ambient-mode)  
+> 47. A Deep Dive into Istio Ambient Mesh :: SREKubeCraft, [https://srekubecraft.io/posts/istio-ambient-mesh/](https://srekubecraft.io/posts/istio-ambient-mesh/)  
+> 48. Which Data Plane Should I Use—Sidecar, Ambient, Cilium, or gRPC?, [https://tetrate.io/blog/ambient-vs-sidecar](https://tetrate.io/blog/ambient-vs-sidecar)  
+> 49. Linkerd vs Istio Ambient: 2026 Architecture Comparison \- Buoyant.io, [https://www.buoyant.io/articles/linkerd-vs-istio-ambient-mode-an-operators-architecture-comparison-for-2026](https://www.buoyant.io/articles/linkerd-vs-istio-ambient-mode-an-operators-architecture-comparison-for-2026)  
+> 50. Thoughtworks Technology Radar, [https://www.thoughtworks.com/content/dam/thoughtworks/documents/radar/2025/11/tr\_technology\_radar\_vol\_33\_en.pdf](https://www.thoughtworks.com/content/dam/thoughtworks/documents/radar/2025/11/tr_technology_radar_vol_33_en.pdf)  
+> 51. Istio Ambient Waypoint Proxy explained \- Solo, [https://www.solo.io/blog/istio-ambient-waypoint-proxy-deployment-model-explained](https://www.solo.io/blog/istio-ambient-waypoint-proxy-deployment-model-explained)  
+> 52. Security Risks for Sidecar Containers in Kubernetes \- Aaltodoc, [https://aaltodoc.aalto.fi/server/api/core/bitstreams/afda5fe4-edbe-43bb-996f-92ff0a663977/content](https://aaltodoc.aalto.fi/server/api/core/bitstreams/afda5fe4-edbe-43bb-996f-92ff0a663977/content)  
+> 53. Istio 1.30 Deep Dive — Agentgateway, Ambient Multicluster, [https://dev.to/x4nent/istio-130-deep-dive-agentgateway-ambient-multicluster-trafficextension-api-and-4-cve-patches-431d](https://dev.to/x4nent/istio-130-deep-dive-agentgateway-ambient-multicluster-trafficextension-api-and-4-cve-patches-431d)  
+> 54. Service Mesh Proxy Models for Cloud-Native Applications, [https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-233.pdf](https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-233.pdf)  
+> 55. Introducing OpenShift Service Mesh 3.3 with post-quantum, [https://www.redhat.com/en/blog/openshift-service-mesh-33-adds-post-quantum-cryptography](https://www.redhat.com/en/blog/openshift-service-mesh-33-adds-post-quantum-cryptography)  
+> 56. Service Mesh vs API Gateway: What's The Difference? \- Kong Inc., [https://konghq.com/blog/enterprise/the-difference-between-api-gateways-and-service-mesh](https://konghq.com/blog/enterprise/the-difference-between-api-gateways-and-service-mesh)  
+> 57. The Journey to Zero Trust Architecture for PCI DSS 4.0, [https://www.pcisecuritystandards.org/wp-content/uploads/2024/09/Day-1\_Track-2\_8\_KSteele\_FINAL.pdf](https://www.pcisecuritystandards.org/wp-content/uploads/2024/09/Day-1_Track-2_8_KSteele_FINAL.pdf)  
+> 58. Beyond Sidecar: A Deep Dive into Istio Ambient Mode Traffic, [https://jimmysong.io/blog/beyond-sidecar/](https://jimmysong.io/blog/beyond-sidecar/)  
+> 59. Istio support for Envoy dynamic modules \#58440 \- GitHub, [https://github.com/istio/istio/discussions/58440](https://github.com/istio/istio/discussions/58440)  
+> 60. Chapter 25\. OVN-Kubernetes network plugin, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.13/html/networking/ovn-kubernetes-network-plugin](https://docs.redhat.com/en/documentation/openshift_container_platform/4.13/html/networking/ovn-kubernetes-network-plugin)  
+> 61. Chapter 23\. OVN-Kubernetes default CNI network provider, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.11/html/networking/ovn-kubernetes-default-cni-network-provider](https://docs.redhat.com/en/documentation/openshift_container_platform/4.11/html/networking/ovn-kubernetes-default-cni-network-provider)  
+> 62. README.md \- openshift/cluster-network-operator \- GitHub, [https://github.com/openshift/cluster-network-operator/blob/master/README.md](https://github.com/openshift/cluster-network-operator/blob/master/README.md)  
+> 63. Chapter 6\. Configuring IPsec encryption | Network security | 4.20, [https://docs.redhat.com/en/documentation/openshift\_container\_platform/4.20/html/network\_security/configuring-ipsec-ovn](https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/network_security/configuring-ipsec-ovn)  
+> 64. Configuring IPsec encryption \- OVN-Kubernetes network plugin, [https://docs.okd.io/4.14/networking/ovn\_kubernetes\_network\_provider/configuring-ipsec-ovn.html](https://docs.okd.io/4.14/networking/ovn_kubernetes_network_provider/configuring-ipsec-ovn.html)  
+> 65. IBM WebSphere Hybrid Edition, [https://www.ibm.com/docs/en/SSNMZP/pdf/websphere-hybrid-documentation.pdf](https://www.ibm.com/docs/en/SSNMZP/pdf/websphere-hybrid-documentation.pdf)  
+> 66. Locking down workloads in OpenShift | by Mezbaur Rahman \- Medium, [https://medium.com/@mezba/locking-down-workloads-in-openshift-501b48e36f9](https://medium.com/@mezba/locking-down-workloads-in-openshift-501b48e36f9)  
+> 67. oauth-proxy/contrib/sidecar.yaml at master \- GitHub, [https://github.com/openshift/oauth-proxy/blob/master/contrib/sidecar.yaml](https://github.com/openshift/oauth-proxy/blob/master/contrib/sidecar.yaml)  
+> 68. How to use Openshift OAuth server as authentication provider for my, [https://stackoverflow.com/questions/64692264/how-to-use-openshift-oauth-server-as-authentication-provider-for-my-web-app-runn](https://stackoverflow.com/questions/64692264/how-to-use-openshift-oauth-server-as-authentication-provider-for-my-web-app-runn)  
+> 69. \< Marvin\> What is the best way to improve Prefect open sourc, [https://linen.prefect.io/t/29726560/ulva73b9p-what-is-the-best-way-to-improve-prefect-open-sourc](https://linen.prefect.io/t/29726560/ulva73b9p-what-is-the-best-way-to-improve-prefect-open-sourc)  
+> 70. Kubernetes Glossary \- Cast AI, [https://cast.ai/kubernetes-glossary/](https://cast.ai/kubernetes-glossary/)  
+> 71. OpenShift ACS Security for Kubernetes | K8s Recipes, [https://kubernetes.recipes/recipes/security/openshift-acs-kubernetes/](https://kubernetes.recipes/recipes/security/openshift-acs-kubernetes/)  
+> 72. RHACS Network Segmentation Policies | K8s Recipes, [https://kubernetes.recipes/recipes/security/rhacs-network-segmentation/](https://kubernetes.recipes/recipes/security/rhacs-network-segmentation/)  
+> 73. Chapter 8\. Managing network policies \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/3.73/html/operating/manage-network-policies](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/3.73/html/operating/manage-network-policies)  
+> 74. Chapter 6\. Managing network policies \- Red Hat Documentation, [https://docs.redhat.com/en/documentation/red\_hat\_advanced\_cluster\_security\_for\_kubernetes/3.69/html/operating/manage-network-policies](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_security_for_kubernetes/3.69/html/operating/manage-network-policies)
